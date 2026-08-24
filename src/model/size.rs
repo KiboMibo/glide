@@ -69,6 +69,17 @@ impl ContainerKind {
             _ => false,
         }
     }
+
+    /// Returns the kind with the opposite orientation.
+    pub fn flip(self) -> Self {
+        use ContainerKind::*;
+        match self {
+            Horizontal => Vertical,
+            Vertical => Horizontal,
+            Tabbed => Stacked,
+            Stacked => Tabbed,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
