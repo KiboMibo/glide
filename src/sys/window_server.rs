@@ -44,6 +44,15 @@ impl WindowServerId {
     pub fn as_u32(&self) -> u32 {
         self.0
     }
+
+    /// Returns `None` for `kCGNullWindowID`, which means "no window".
+    fn from_raw(id: CGWindowID) -> Option<Self> {
+        if id == kCGNullWindowID {
+            None
+        } else {
+            Some(WindowServerId(id))
+        }
+    }
 }
 
 impl Into<u32> for WindowServerId {
@@ -60,7 +69,9 @@ impl TryFrom<&AXUIElement> for WindowServerId {
         if let Some(err) = accessibility::AXError::from_raw(res) {
             return Err(accessibility::Error::Ax(err));
         }
-        Ok(WindowServerId(id))
+        // _AXUIElementGetWindow can succeed while leaving `id` at kCGNullWindowID (seen from
+        // Control Center); treat that as no id.
+        Self::from_raw(id).ok_or(accessibility::Error::NotFound)
     }
 }
 
@@ -564,4 +575,15 @@ unsafe extern "C" {
         key: &CFString,
         value: &CFType,
     ) -> CGError;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_server_id_from_raw_rejects_null_window_id() {
+        assert_eq!(WindowServerId::from_raw(kCGNullWindowID), None);
+        assert_eq!(WindowServerId::from_raw(42), Some(WindowServerId(42)));
+    }
 }

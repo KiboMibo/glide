@@ -1214,14 +1214,14 @@ impl State {
 
     fn id(&self, elem: &AXUIElement) -> Result<WindowId, accessibility::Error> {
         if let Ok(id) = WindowServerId::try_from(elem) {
-            let wid = WindowId {
-                pid: self.pid,
-                idx: NonZeroU32::new(id.as_u32()).expect("Window server id was 0"),
-            };
+            let wid = WindowId::with_wsid(self.pid, id);
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
             }
-        } else if let Some((&wid, _)) = self.windows.iter().find(|(_, w)| &*w.elem == elem) {
+        }
+        // The element may be registered under a manual index if it had no window
+        // server id at registration time but has since acquired one.
+        if let Some((&wid, _)) = self.windows.iter().find(|(_, w)| &*w.elem == elem) {
             return Ok(wid);
         }
         Err(accessibility::Error::NotFound)
