@@ -1,0 +1,90 @@
+{
+  "skill": "coding-test",
+  "status": "PASS_WITH_FINDINGS",
+  "date": "2026-09-16",
+  "branch": "test/R3-tests-round2",
+  "commits": ["e7b08ad", "03c65ea", "9512ab1"],
+  "scope": {
+    "source": "plan:docs/plans/2026-09-16-scratchpad.md#R3-test (round 2, after F3)",
+    "files": [
+      "src/model/scratchpad.rs",
+      "src/actor/layout.rs",
+      "src/actor/reactor.rs",
+      "src/actor/reactor/main_window.rs",
+      "src/actor/window_server.rs",
+      "src/sys/app.rs"
+    ]
+  },
+  "previous_round": {
+    "report": "docs/plans/reviews/scratchpad-R3-test.md",
+    "findings": [
+      { "id": 1, "status": "closed", "test": "actor::reactor::tests::scratchpad::edge_cases::removed_rule_stops_the_window_being_a_scratchpad_after_reload" },
+      { "id": 2, "status": "closed", "note": "детерминировано; главное окно не предпочитается между экранами (находка A)" },
+      { "id": 3, "status": "deferred_to_T6" }
+    ]
+  },
+  "tests": {
+    "added": 12,
+    "run_command": "cargo test --no-fail-fast",
+    "baseline": { "passed": 390, "failed": 0, "doc_passed": 7 },
+    "final": { "passed": 402, "failed": 0, "doc_passed": 7 },
+    "failing": [],
+    "flaky": []
+  },
+  "coverage": {
+    "changed_lines_pct": 95,
+    "threshold": 80,
+    "threshold_met": true,
+    "repo_pct": null,
+    "basis": "ручная оценка по diff F3 (cargo llvm-cov не установлен), подтверждена мутациями; не исполняются настоящий launcher (src/actor/reactor.rs:398-409), поток open в launch_app_then и недостижимые запасные ветки toggle"
+  },
+  "findings": [
+    {
+      "severity": "important",
+      "title": "Главное окно не выбирается scratchpad, если оно на другом экране или появилось не первым",
+      "file": "src/actor/reactor.rs",
+      "line": 1058,
+      "impact": "Расходится с glide.default.toml:262 («the app's main window if it matches»); выбор детерминирован, основной сценарий с одним окном не затронут.",
+      "suggestion": "Уточнить документацию или сортировать окна до разбиения по экранам."
+    },
+    {
+      "severity": "note",
+      "title": "Настоящий launcher в Reactor::spawn (срок 30 с, ошибка open) не покрыт тестами",
+      "file": "src/actor/reactor.rs",
+      "line": 398,
+      "impact": "Ошибку в условии ожидания или отправки события тесты не заметят.",
+      "suggestion": "Вынести замыкание в функцию с подменяемым запуском и протестировать."
+    },
+    {
+      "severity": "note",
+      "title": "Защитный код очереди показов не влияет на наблюдаемое поведение (эквивалентные мутанты N8, N9, N16, N18, N19)",
+      "file": "src/actor/layout.rs",
+      "line": 1210,
+      "impact": "Нет.",
+      "suggestion": "Оставить или упростить."
+    },
+    {
+      "severity": "note",
+      "title": "launch_app_then_does_not_call_back_for_an_invalid_id при регрессии валидации запустит настоящий open, а panic в колбэке тест не роняет",
+      "file": "src/sys/app.rs",
+      "line": 410,
+      "impact": "Слабая защита колбэка и риск побочного эффекта в тестах.",
+      "suggestion": "Проверять validate_bundle_id напрямую или подменять запуск."
+    },
+    {
+      "severity": "note",
+      "title": "hidden_change_schedules_a_recheck ждёт реальный поток с задержкой 250 мс",
+      "file": "src/actor/window_server.rs",
+      "line": 632,
+      "impact": "Небольшой риск мигания на перегруженном CI (запас 5 с).",
+      "suggestion": "Передавать задержку параметром."
+    }
+  ],
+  "sensitivity_check": {
+    "spot_check": { "tests_checked": 28, "detected_defect": 23, "note": "28 ручных мутаций кода F3; 5 выживших эквивалентны (N8, N9, N16, N18, N19)" },
+    "not_overspecified": { "checked": true, "green_after_fix": null },
+    "mutation": { "run": false, "reason": "cargo-mutants не установлен; выполнены ручные мутации" }
+  },
+  "report_md": "docs/plans/reviews/scratchpad-R3-test-round2.md",
+  "next_action": "Волну 3 можно закрывать; находку A решить с человеком (документация или сортировка), остальные замечания необязательны."
+}

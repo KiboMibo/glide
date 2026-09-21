@@ -1,0 +1,71 @@
+{
+  "skill": "coding-test",
+  "status": "PASS_WITH_FINDINGS",
+  "date": "2026-09-16",
+  "scope": {
+    "source": "plan:docs/plans/2026-09-16-scratchpad.md#R2-test",
+    "files": [
+      "src/actor/app.rs",
+      "src/actor/reactor.rs",
+      "src/actor/reactor/testing.rs",
+      "src/actor/reactor/main_window.rs",
+      "src/sys/app.rs"
+    ]
+  },
+  "tests": {
+    "added": 11,
+    "run_command": "cargo test",
+    "baseline": { "passed": 311, "failed": 0 },
+    "final": { "passed": 322, "failed": 0 },
+    "failing": [],
+    "flaky": []
+  },
+  "coverage": {
+    "changed_lines_pct": 77,
+    "threshold": 80,
+    "threshold_met": false,
+    "repo_pct": null,
+    "basis": "ручной подсчёт исполняемых изменённых строк (cargo llvm-cov не установлен), подтверждён мутациями; непокрыто только то, что требует живого AX/AppKit: actor/app.rs:480,553-558,734-738,752-755; sys/app.rs:144"
+  },
+  "findings": [
+    {
+      "severity": "note",
+      "title": "Поток приложения (SetHidden, уведомления hide/show, начальное чтение) не покрыт тестами",
+      "file": "src/actor/app.rs",
+      "line": 752,
+      "impact": "Неработающие на macOS 27 уведомления или set_app_hidden не будут замечены тестами.",
+      "suggestion": "Ручная проверка Cmd+H/SetHidden на машине пользователя в T5 или приёмке."
+    },
+    {
+      "severity": "note",
+      "title": "Request::Terminate в стенде отбрасывает запросы других приложений (с большим pid) из той же пачки",
+      "file": "src/actor/reactor/testing.rs",
+      "line": 250,
+      "impact": "Тест T5 с завершением одного приложения и скрытием другого может молча не получить ответ на SetHidden.",
+      "suggestion": "Пропускать только запросы pid, получившего Terminate (F2/T5)."
+    },
+    {
+      "severity": "note",
+      "title": "requests()/tagged_requests() группируют запросы по pid, межприложенческий порядок не наблюдаем",
+      "file": "src/actor/reactor/testing.rs",
+      "line": 205,
+      "impact": "Ошибки порядка между приложениями не ловятся тестами.",
+      "suggestion": "Проверять порядок в пределах pid или добавить общий журнал с номерами."
+    },
+    {
+      "severity": "note",
+      "title": "Стенд отвечает на каждый SetHidden, даже без смены состояния",
+      "file": "src/actor/reactor/testing.rs",
+      "line": 320,
+      "impact": "Расходится с macOS; станет важно, если T5 начнёт действовать по ApplicationHiddenChanged.",
+      "suggestion": "Учесть в T5; при необходимости отвечать только на изменение."
+    }
+  ],
+  "sensitivity_check": {
+    "spot_check": { "tests_checked": 15, "detected_defect": 13, "mutations_applied": 13, "mutations_killed": 13 },
+    "not_overspecified": { "checked": false, "green_after_fix": null, "reason": "падающих тестов и предлагаемых исправлений нет" },
+    "mutation": { "run": false, "reason": "cargo-mutants в проекте не настроен" }
+  },
+  "report_md": "docs/plans/reviews/scratchpad-R2-test.md",
+  "next_action": "Волну 2 можно закрывать; F2 не обязательна, замечания 2-4 учесть в T5, замечание 1 — ручная проверка на живой системе."
+}

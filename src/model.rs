@@ -6,6 +6,7 @@
 
 mod layout_mapping;
 mod layout_tree;
+pub mod scratchpad;
 mod scroll_constraints;
 pub mod scroll_viewport;
 mod selection;

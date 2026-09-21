@@ -1,0 +1,94 @@
+{
+  "skill": "coding-test",
+  "status": "PASS_WITH_FINDINGS",
+  "date": "2026-09-16",
+  "scope": {
+    "source": "plan:docs/plans/2026-09-16-scratchpad.md#R1-test",
+    "files": [
+      "src/model/scratchpad.rs",
+      "src/config.rs",
+      "src/actor/layout.rs",
+      "src/actor/reactor.rs",
+      "src/sys/app.rs",
+      "src/sys/space_move.rs"
+    ]
+  },
+  "tests": {
+    "added": 40,
+    "run_command": "cargo test",
+    "baseline": { "passed": 263, "failed": 0 },
+    "final": { "passed": 303, "failed": 0 },
+    "failing": [],
+    "flaky": []
+  },
+  "coverage": {
+    "changed_lines_pct": 95.7,
+    "threshold": 80,
+    "threshold_met": true,
+    "repo_pct": null,
+    "basis": "git diff main по файлам скоупа, включая строки тестов; непокрытое — только FFI/живая система (sys/app.rs:49,77-89; sys/space_move.rs:32-64) и panic-ветки тестов"
+  },
+  "findings": [
+    {
+      "severity": "important",
+      "title": "Лишние/опечатанные поля toggle_scratchpad молча игнорируются",
+      "file": "src/actor/reactor.rs",
+      "line": 217,
+      "impact": "Опечатка `lanch` даёт launch = None без ошибки конфига; приложение не запускается.",
+      "suggestion": "#[serde(deny_unknown_fields)] на ReactorCommand/вариант и тест на опечатку.",
+      "test": null
+    },
+    {
+      "severity": "note",
+      "title": "Имя scratchpad из одних пробелов принимается",
+      "file": "src/config.rs",
+      "line": 178,
+      "impact": "Неочевидная конфигурация проходит валидацию.",
+      "suggestion": "Проверять name.trim().is_empty() (по решению человека).",
+      "test": null
+    },
+    {
+      "severity": "note",
+      "title": "Два правила с одним именем scratchpad принимаются без предупреждения",
+      "file": "src/config.rs",
+      "line": 175,
+      "impact": "Какое окно и frame победят, зависит от порядка появления окон.",
+      "suggestion": "Решить в T5 (отклонять/предупреждать/брать первое правило).",
+      "test": "config::tests::two_rules_with_the_same_scratchpad_name_are_accepted"
+    },
+    {
+      "severity": "note",
+      "title": "remove_app не сбрасывает pending show",
+      "file": "src/model/scratchpad.rs",
+      "line": 108,
+      "impact": "Окно, появившееся много позже, будет неожиданно показано (известное упрощение плана).",
+      "suggestion": "Пересмотреть в T5.",
+      "test": null
+    },
+    {
+      "severity": "note",
+      "title": "validated сдвигает x/y на ε при x + width = 1",
+      "file": "src/model/scratchpad.rs",
+      "line": 42,
+      "impact": "x = 0.2, width = 0.8 даёт x = 0.19999999999999996; на пиксели не влияет.",
+      "suggestion": "Не менять.",
+      "test": null
+    },
+    {
+      "severity": "note",
+      "title": "move_window_to_space/spaces_for_window не тестируются без живой системы",
+      "file": "src/sys/space_move.rs",
+      "line": 32,
+      "impact": "Регрессии FFI видны только вживую.",
+      "suggestion": "В T6 абстрагировать вызов для тестов Reactor.",
+      "test": null
+    }
+  ],
+  "sensitivity_check": {
+    "spot_check": { "tests_checked": 40, "detected_defect": 40, "before_r1_detected": 38, "survived_before_r1": ["R6 wrong rule index in error", "C3 scratchpad bypasses phantom check"] },
+    "not_overspecified": { "checked": true, "green_after_fix": null },
+    "mutation": { "run": false, "reason": "cargo-mutants в проекте не установлен; выполнено 40 ручных мутаций скриптом" }
+  },
+  "report_md": "docs/plans/reviews/scratchpad-R1-test.md",
+  "next_action": "Волну можно закрывать; находку 1 взять в F1 (или решением человека отложить), находки 3-4 передать T5."
+}

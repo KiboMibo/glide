@@ -17,6 +17,9 @@ use tracing::{debug, error, warn};
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
 use crate::config::{Config, NewWindowPlacement, ScrollConfig, WindowRule, WindowRuleConditions};
+use crate::model::scratchpad::{
+    FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState, Scratchpads,
+};
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
@@ -67,6 +70,10 @@ pub enum LayoutEvent {
     AppClosed(pid_t),
     /// Updates the set of windows for a given app and space.
     WindowsOnScreenUpdated(SpaceId, pid_t, Vec<(WindowId, LayoutWindowInfo)>),
+    /// Windows that may be scratchpad windows, the preferred one first,
+    /// including windows on spaces that are not managed. Registers the ones
+    /// that match a scratchpad rule without changing any layout.
+    ScratchpadCandidates(Vec<(WindowId, LayoutWindowInfo)>),
     WindowAdded(SpaceId, WindowId, LayoutWindowInfo),
     WindowRemoved(WindowId),
     WindowSpaceChanged {
@@ -250,6 +257,12 @@ pub struct LayoutManager {
     #[serde(skip)]
     window_rules: Vec<WindowRule>,
     #[serde(skip)]
+    scratchpads: Scratchpads,
+    /// Scratchpad windows that were registered while a show was pending, in
+    /// registration order. The Reactor takes them after every event.
+    #[serde(skip)]
+    scratchpads_to_show: Vec<WindowId>,
+    #[serde(skip)]
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
     interactive_move: Option<InteractiveScrollMove>,
@@ -293,6 +306,19 @@ fn window_rule_matches(conditions: &WindowRuleConditions, info: &LayoutWindowInf
         && eq(conditions.ax_subrole.as_deref(), info.ax_subrole.as_deref())
 }
 
+/// The scratchpad name and frame of the first rule matching the window, if that
+/// rule has a scratchpad.
+fn scratchpad_rule<'a>(
+    rules: &'a [WindowRule],
+    info: &LayoutWindowInfo,
+) -> Option<(&'a str, FractionalRect)> {
+    let rule = rules.iter().find(|rule| window_rule_matches(&rule.conditions, info))?;
+    Some((
+        rule.scratchpad.as_deref()?,
+        rule.frame.unwrap_or(FractionalRect::DEFAULT),
+    ))
+}
+
 fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass {
     use LayoutWindowInfo as Info;
 
@@ -332,7 +358,7 @@ fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass
 
     // The first matching user rule overrides the built-in heuristics below.
     if let Some(rule) = rules.iter().find(|rule| window_rule_matches(&rule.conditions, info)) {
-        return if rule.float {
+        return if rule.scratchpad.is_some() || rule.float == Some(true) {
             WindowClass::FloatByDefault
         } else {
             WindowClass::Regular
@@ -371,6 +397,8 @@ impl LayoutManager {
             scroll_cfg: Config::default().settings.experimental.scroll.validated(),
             scroll_enabled: false,
             window_rules: Vec::new(),
+            scratchpads: Scratchpads::default(),
+            scratchpads_to_show: Vec::new(),
             interactive_resize: None,
             interactive_move: None,
             config,
@@ -382,7 +410,21 @@ impl LayoutManager {
         self.config = config.clone();
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
-        self.window_rules = config.window_rules.clone();
+        // Configs received over IPC skip `Config::load`, so validate here too.
+        self.window_rules = config
+            .window_rules
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter_map(|(i, rule)| {
+                rule.validated()
+                    .inspect_err(|err| warn!("Ignoring window_rules[{i}]: {err}"))
+                    .ok()
+            })
+            .collect();
+        let names: BTreeSet<&str> =
+            self.window_rules.iter().filter_map(|rule| rule.scratchpad.as_deref()).collect();
+        self.scratchpads.retain_names(|name| names.contains(name));
         self.default_layout_kind = match (self.scroll_enabled, config.settings.default_layout_kind)
         {
             (false, LayoutKind::Scroll) => {
@@ -596,8 +638,24 @@ impl LayoutManager {
                 for wid in new_windows {
                     self.add_scroll_window(layout, wid);
                 }
-                for wid in add_floating {
+                for &wid in &add_floating {
                     self.add_floating_window(wid, Some(space));
+                }
+                for (wid, info) in &windows {
+                    if self.floating_windows.contains(wid) {
+                        self.register_scratchpad(*wid, info);
+                    }
+                }
+            }
+            LayoutEvent::ScratchpadCandidates(windows) => {
+                for (wid, info) in &windows {
+                    let floats = self.floating_windows.contains(wid)
+                        || !self.tree.has_window(*wid)
+                            && classify_window(&self.window_rules, info)
+                                == WindowClass::FloatByDefault;
+                    if floats {
+                        self.register_scratchpad(*wid, info);
+                    }
                 }
             }
             LayoutEvent::AppsRunningUpdated(hash_set) => {
@@ -605,6 +663,8 @@ impl LayoutManager {
                 self.floating_restore_frames.retain(|wid, _| hash_set.contains(&wid.pid));
             }
             LayoutEvent::AppClosed(pid) => {
+                self.scratchpads.remove_app(pid);
+                self.scratchpads_to_show.retain(|wid| wid.pid != pid);
                 self.tree.remove_windows_for_app(pid);
                 self.floating_windows.remove_all_for_pid(pid);
                 self.floating_restore_frames.retain(|wid, _| wid.pid != pid);
@@ -615,7 +675,10 @@ impl LayoutManager {
                     .entry(wid)
                     .or_insert(FloatingRestoreFrame { frame: info.frame });
                 match classify_window(&self.window_rules, &info) {
-                    WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
+                    WindowClass::FloatByDefault => {
+                        self.add_floating_window(wid, Some(space));
+                        self.register_scratchpad(wid, &info);
+                    }
                     WindowClass::Regular => {
                         let layout = self.layout(space);
                         if self.tree.is_scroll_layout(layout) {
@@ -628,6 +691,8 @@ impl LayoutManager {
                 }
             }
             LayoutEvent::WindowRemoved(wid) => {
+                self.scratchpads.remove_window(wid);
+                self.scratchpads_to_show.retain(|w| *w != wid);
                 self.tree.remove_window(wid);
                 self.floating_windows.remove(&wid);
                 self.floating_restore_frames.remove(&wid);
@@ -643,6 +708,7 @@ impl LayoutManager {
                     // in active_floating_windows.
                     if let Some(added) = added {
                         self.add_floating_window(wid, Some(added));
+                        self.register_scratchpad(wid, &info);
                     }
                     if let Some(removed) = removed {
                         self.active_floating_windows.remove(removed, wid);
@@ -660,7 +726,8 @@ impl LayoutManager {
                         match class {
                             WindowClass::Untracked => (),
                             WindowClass::FloatByDefault => {
-                                self.add_floating_window(wid, Some(added))
+                                self.add_floating_window(wid, Some(added));
+                                self.register_scratchpad(wid, &info);
                             }
                             WindowClass::Regular => {
                                 let layout = self.layout(added);
@@ -684,7 +751,9 @@ impl LayoutManager {
             LayoutEvent::WindowFocused(spaces, wid) => {
                 self.focused_window = Some(wid);
                 if self.floating_windows.contains(&wid) {
-                    self.last_floating_focus = Some(wid);
+                    if !self.scratchpads.is_scratchpad(wid) {
+                        self.last_floating_focus = Some(wid);
+                    }
                 } else {
                     for space in &spaces {
                         self.clear_user_scrolling(*space);
@@ -805,6 +874,10 @@ impl LayoutManager {
             let Some(wid) = self.focused_window else {
                 return EventResponse::default();
             };
+            if self.scratchpads.is_scratchpad(wid) {
+                debug!(?wid, "Scratchpad windows always float");
+                return EventResponse::default();
+            }
             if is_floating {
                 self.remove_floating_window(wid, space);
                 self.last_floating_focus = None;
@@ -855,6 +928,7 @@ impl LayoutManager {
                     .active_floating_windows
                     .in_space(space)
                     .filter(|&wid| Some(wid) != self.last_floating_focus)
+                    .filter(|&wid| !self.scratchpads.is_scratchpad(wid))
                     .collect();
                 // We need to focus some window to transition into floating
                 // mode. If there is no last floating window, pick one.
@@ -1109,6 +1183,71 @@ impl LayoutManager {
 }
 
 impl LayoutManager {
+    /// Decides what toggling the named scratchpad should do. Without a bundle
+    /// id to `launch`, a missing window is not shown when it appears later.
+    pub fn toggle_scratchpad(
+        &mut self,
+        name: &str,
+        launch: Option<&str>,
+        state: impl Fn(WindowId) -> ScratchpadWindowState,
+    ) -> ScratchpadAction {
+        self.scratchpads.toggle(name, launch, state)
+    }
+
+    /// The show that a toggle left pending for the name.
+    pub fn pending_scratchpad_show(&self, name: &str) -> Option<PendingShowId> {
+        self.scratchpads.pending_show(name)
+    }
+
+    /// Drops a pending show whose launch failed or took too long. Returns the
+    /// scratchpad name if the show was still pending.
+    pub fn cancel_scratchpad_show(&mut self, id: PendingShowId) -> Option<String> {
+        self.scratchpads.cancel_pending_show(id)
+    }
+
+    /// Drops the pending shows that launched an app that has quit.
+    pub fn cancel_scratchpad_shows_for_app(&mut self, bundle_id: &str) {
+        self.scratchpads.cancel_pending_shows_for_app(bundle_id);
+    }
+
+    pub fn scratchpad_window(&self, name: &str) -> Option<WindowId> {
+        self.scratchpads.window(name).map(|(wid, _)| wid)
+    }
+
+    pub fn scratchpad_frame(&self, wid: WindowId) -> Option<FractionalRect> {
+        let name = self.scratchpads.name_of(wid)?;
+        self.scratchpads.window(name).map(|(_, frame)| frame)
+    }
+
+    /// The next scratchpad window that should be shown now because it
+    /// appeared after a toggle launched its app. Must be drained after every
+    /// [`LayoutManager::handle_event`].
+    pub fn take_scratchpad_to_show(&mut self) -> Option<(WindowId, FractionalRect)> {
+        while !self.scratchpads_to_show.is_empty() {
+            let wid = self.scratchpads_to_show.remove(0);
+            if let Some(frame) = self.scratchpad_frame(wid) {
+                return Some((wid, frame));
+            }
+        }
+        None
+    }
+
+    fn register_scratchpad(&mut self, wid: WindowId, info: &LayoutWindowInfo) {
+        let Some((name, frame)) = scratchpad_rule(&self.window_rules, info) else {
+            if let Some(name) = self.scratchpads.remove_window(wid) {
+                debug!(?wid, name, "Window no longer matches a scratchpad rule");
+            }
+            return;
+        };
+        if !self.scratchpads.register(name, wid, frame) {
+            debug!(?wid, name, "Scratchpad already has a window");
+            return;
+        }
+        if self.scratchpads.take_pending_show(name) {
+            self.scratchpads_to_show.push(wid);
+        }
+    }
+
     fn is_floating(&self) -> bool {
         if let Some(focus) = self.focused_window {
             self.floating_windows.contains(&focus)
@@ -1765,7 +1904,9 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: true,
+            float: Some(true),
+            scratchpad: None,
+            frame: None,
         }];
 
         let mut info = win_info();
@@ -1785,14 +1926,18 @@ mod tests {
                     title_regex: Some("Dialog".parse().unwrap()),
                     ..Default::default()
                 },
-                float: true,
+                float: Some(true),
+                scratchpad: None,
+                frame: None,
             },
             WindowRule {
                 conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
-                float: false,
+                float: Some(false),
+                scratchpad: None,
+                frame: None,
             },
         ];
 
@@ -1815,7 +1960,9 @@ mod tests {
                 ax_subrole: Some("AXDialog".into()),
                 ..Default::default()
             },
-            float: true,
+            float: Some(true),
+            scratchpad: None,
+            frame: None,
         }];
 
         let mut info = win_info();
@@ -1841,7 +1988,9 @@ mod tests {
                 ax_role: Some("axwindow".into()),
                 ax_subrole: Some("AXDIALOG".into()),
             },
-            float: true,
+            float: Some(true),
+            scratchpad: None,
+            frame: None,
         }];
 
         let mut info = win_info();
@@ -1862,7 +2011,9 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: true,
+            float: Some(true),
+            scratchpad: None,
+            frame: None,
         }];
         let mut info = win_info();
         info.bundle_id = None;
@@ -1877,7 +2028,9 @@ mod tests {
                 app_id: Some("com.apple.systempreferences".into()),
                 ..Default::default()
             },
-            float: false,
+            float: Some(false),
+            scratchpad: None,
+            frame: None,
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.apple.systempreferences".into());
@@ -1889,7 +2042,9 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: false,
+            float: Some(false),
+            scratchpad: None,
+            frame: None,
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.example.X".into());
@@ -1898,14 +2053,462 @@ mod tests {
     }
 
     #[test]
-    fn rules_cannot_override_untracked_phantom_windows() {
+    fn scratchpad_rule_floats_window() {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: None,
+            scratchpad: Some("x".into()),
+            frame: None,
+        }];
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+
+        info.bundle_id = Some("com.example.Y".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    fn app_rule(app_id: &str, float: Option<bool>, scratchpad: Option<&str>) -> WindowRule {
+        WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some(app_id.into()),
+                ..Default::default()
+            },
+            float,
+            scratchpad: scratchpad.map(Into::into),
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn scratchpad_rule_with_float_true_floats_window() {
+        let rules = [app_rule("com.example.X", Some(true), Some("x"))];
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+    }
+
+    #[test]
+    fn first_matching_rule_decides_between_scratchpad_and_tiling() {
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        info.is_resizable = false;
+
+        let scratchpad_first = [
+            app_rule("com.example.X", None, Some("x")),
+            app_rule("com.example.X", Some(false), None),
+        ];
+        assert_eq!(
+            classify_window(&scratchpad_first, &info),
+            WindowClass::FloatByDefault
+        );
+
+        let tiling_first = [
+            app_rule("com.example.X", Some(false), None),
+            app_rule("com.example.X", None, Some("x")),
+        ];
+        assert_eq!(classify_window(&tiling_first, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn scratchpad_rule_cannot_track_phantom_windows() {
         let rules = [WindowRule {
             conditions: WindowRuleConditions::default(),
-            float: true,
+            float: None,
+            scratchpad: Some("x".into()),
+            frame: None,
         }];
         let mut info = win_info();
         info.layer = Some(3);
         assert_eq!(classify_window(&rules, &info), WindowClass::Untracked);
+    }
+
+    #[test]
+    fn rules_cannot_override_untracked_phantom_windows() {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions::default(),
+            float: Some(true),
+            scratchpad: None,
+            frame: None,
+        }];
+        let mut info = win_info();
+        info.layer = Some(3);
+        assert_eq!(classify_window(&rules, &info), WindowClass::Untracked);
+    }
+
+    fn scratchpad_manager(frame: Option<FractionalRect>) -> (LayoutManager, SpaceId) {
+        let mut config = Config::default();
+        config.window_rules = vec![WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.example.pad".into()),
+                ..Default::default()
+            },
+            float: None,
+            scratchpad: Some("k".into()),
+            frame,
+        }];
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&Arc::new(config));
+        let space = SpaceId::new(1);
+        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space, rect(0, 0, 120, 120).size));
+        (mgr, space)
+    }
+
+    fn pad_info() -> LayoutWindowInfo {
+        LayoutWindowInfo {
+            bundle_id: Some("com.example.pad".into()),
+            ..win_info()
+        }
+    }
+
+    const PAD: Option<&str> = Some("com.example.pad");
+
+    const SHOWN: ScratchpadWindowState = ScratchpadWindowState {
+        app_hidden: false,
+        focused: true,
+        on_active_space: true,
+    };
+
+    #[test]
+    fn scratchpad_candidates_are_registered_without_layout_changes() {
+        let (mut mgr, space) = scratchpad_manager(None);
+        let tiled = make_windows(1, 1);
+        _ = mgr.handle_event(LayoutEvent::WindowsOnScreenUpdated(space, 1, tiled.clone()));
+        let before = mgr.calculate_layout(space, rect(0, 0, 120, 120), &Config::default());
+
+        let pad = WindowId::new(2, 2);
+        let other = WindowId::new(2, 1);
+        let mut candidates = vec![(pad, pad_info()), (other, pad_info())];
+        // A tiled window is not taken even if a rule would float it now.
+        candidates.insert(0, (tiled[0].0, pad_info()));
+        _ = mgr.handle_event(LayoutEvent::ScratchpadCandidates(candidates));
+
+        assert_eq!(mgr.scratchpad_window("k"), Some(pad));
+        assert!(mgr.floating_windows_in_space(space).is_empty());
+        assert_eq!(
+            mgr.calculate_layout(space, rect(0, 0, 120, 120), &Config::default()),
+            before
+        );
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn scratchpad_windows_are_registered_and_float() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        let mut windows = make_windows(1, 1);
+        windows.push((pad, pad_info()));
+        windows.push((WindowId::new(2, 2), pad_info()));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, windows[..1].to_vec()));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 2, windows[1..].to_vec()));
+
+        assert_eq!(mgr.scratchpad_window("k"), Some(pad));
+        assert_eq!(mgr.scratchpad_frame(pad), Some(FractionalRect::DEFAULT));
+        // The second window of the app floats but is not the scratchpad.
+        assert_eq!(mgr.scratchpad_frame(WindowId::new(2, 2)), None);
+        assert_eq!(
+            mgr.floating_windows_in_space(space),
+            [pad, WindowId::new(2, 2)].into_iter().collect()
+        );
+        assert_eq!(
+            mgr.layout_sorted(space, rect(0, 0, 120, 120)),
+            vec![(WindowId::new(1, 1), rect(0, 0, 120, 120))]
+        );
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn restored_floating_window_is_registered() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        mgr.floating_windows.insert(pad);
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 2, vec![(pad, pad_info())]));
+        assert_eq!(mgr.scratchpad_window("k"), Some(pad));
+    }
+
+    #[test]
+    fn scratchpad_toggle_decides_from_window_state() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(
+            mgr.toggle_scratchpad("k", PAD, |_| SHOWN),
+            ScratchpadAction::Hide(pad)
+        );
+        let hidden = ScratchpadWindowState { app_hidden: true, ..SHOWN };
+        assert_eq!(
+            mgr.toggle_scratchpad("k", None, |_| hidden),
+            ScratchpadAction::Show(pad)
+        );
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn launched_scratchpad_is_shown_once_when_it_appears() {
+        use LayoutEvent::*;
+        let frame = FractionalRect {
+            x: 0.0,
+            y: 0.5,
+            width: 1.0,
+            height: 0.5,
+        };
+        let (mut mgr, space) = scratchpad_manager(Some(frame));
+        assert_eq!(
+            mgr.toggle_scratchpad("k", PAD, |_| unreachable!()),
+            ScratchpadAction::Launch
+        );
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(mgr.take_scratchpad_to_show(), Some((pad, frame)));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+
+        _ = mgr.handle_event(WindowRemoved(pad));
+        _ = mgr.handle_event(WindowAdded(space, WindowId::new(2, 3), pad_info()));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn scratchpad_is_not_shown_without_launch() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        assert_eq!(
+            mgr.toggle_scratchpad("k", None, |_| unreachable!()),
+            ScratchpadAction::Launch
+        );
+        _ = mgr.handle_event(WindowAdded(space, WindowId::new(2, 1), pad_info()));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+
+        _ = mgr.toggle_scratchpad("other", PAD, |_| unreachable!());
+        let id = mgr.pending_scratchpad_show("other").unwrap();
+        assert_eq!(mgr.cancel_scratchpad_show(id), Some("other".to_owned()));
+        let rules = mgr.window_rules.clone();
+        mgr.window_rules = vec![WindowRule {
+            scratchpad: Some("other".into()),
+            ..rules[0].clone()
+        }];
+        _ = mgr.handle_event(WindowAdded(space, WindowId::new(3, 1), pad_info()));
+        assert_eq!(mgr.scratchpad_window("other"), Some(WindowId::new(3, 1)));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    fn set_scratchpad_rule(mgr: &mut LayoutManager, name: Option<&str>) {
+        let mut config = Config::default();
+        config.window_rules = name
+            .map(|name| WindowRule {
+                conditions: WindowRuleConditions {
+                    app_id: Some("com.example.pad".into()),
+                    ..Default::default()
+                },
+                float: None,
+                scratchpad: Some(name.into()),
+                frame: None,
+            })
+            .into_iter()
+            .collect();
+        mgr.set_config(&Arc::new(config));
+    }
+
+    #[test]
+    fn reload_without_the_rule_forgets_the_scratchpad() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        set_scratchpad_rule(&mut mgr, None);
+        assert_eq!(mgr.scratchpad_window("k"), None);
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 2, vec![(pad, pad_info())]));
+        assert_eq!(mgr.scratchpad_frame(pad), None);
+        assert_eq!(
+            mgr.floating_windows_in_space(space),
+            [pad].into_iter().collect(),
+            "the window keeps floating"
+        );
+    }
+
+    #[test]
+    fn reload_drops_the_pending_show_of_a_removed_name() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        _ = mgr.toggle_scratchpad("k", PAD, |_| unreachable!());
+        set_scratchpad_rule(&mut mgr, Some("j"));
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(mgr.scratchpad_window("j"), Some(pad));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+
+        // A pending show of a name that is still configured survives.
+        _ = mgr.handle_event(WindowRemoved(pad));
+        _ = mgr.toggle_scratchpad("j", PAD, |_| unreachable!());
+        set_scratchpad_rule(&mut mgr, Some("j"));
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(
+            mgr.take_scratchpad_to_show(),
+            Some((pad, FractionalRect::DEFAULT))
+        );
+    }
+
+    #[test]
+    fn renamed_rule_moves_the_window_on_refresh() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        set_scratchpad_rule(&mut mgr, Some("j"));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 2, vec![(pad, pad_info())]));
+        assert_eq!(mgr.scratchpad_window("k"), None);
+        assert_eq!(mgr.scratchpad_window("j"), Some(pad));
+    }
+
+    #[test]
+    fn scratchpads_registered_by_one_event_are_all_shown() {
+        use LayoutEvent::*;
+        let rule = |subrole: &str, name: &str| WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.example.pad".into()),
+                ax_subrole: Some(subrole.into()),
+                ..Default::default()
+            },
+            float: None,
+            scratchpad: Some(name.into()),
+            frame: None,
+        };
+        let mut config = Config::default();
+        config.window_rules = vec![rule("AXMain", "k"), rule("AXMini", "j")];
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&Arc::new(config));
+        let space = SpaceId::new(1);
+        _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 120, 120).size));
+        _ = mgr.toggle_scratchpad("k", PAD, |_| unreachable!());
+        _ = mgr.toggle_scratchpad("j", PAD, |_| unreachable!());
+
+        let info = |subrole: &str| LayoutWindowInfo {
+            ax_subrole: Some(subrole.into()),
+            ..pad_info()
+        };
+        let (main, mini) = (WindowId::new(2, 1), WindowId::new(2, 2));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(
+            space,
+            2,
+            vec![(main, info("AXMain")), (mini, info("AXMini"))],
+        ));
+        assert_eq!(
+            mgr.take_scratchpad_to_show(),
+            Some((main, FractionalRect::DEFAULT))
+        );
+        assert_eq!(
+            mgr.take_scratchpad_to_show(),
+            Some((mini, FractionalRect::DEFAULT))
+        );
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn scratchpad_show_is_dropped_when_it_expires_or_the_app_quits() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        _ = mgr.toggle_scratchpad("k", PAD, |_| unreachable!());
+        let id = mgr.pending_scratchpad_show("k").unwrap();
+        assert_eq!(mgr.cancel_scratchpad_show(id), Some("k".to_owned()));
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+
+        _ = mgr.handle_event(WindowRemoved(pad));
+        _ = mgr.toggle_scratchpad("k", PAD, |_| unreachable!());
+        mgr.cancel_scratchpad_shows_for_app("com.example.other");
+        assert!(mgr.pending_scratchpad_show("k").is_some());
+        mgr.cancel_scratchpad_shows_for_app("com.example.pad");
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn closed_scratchpad_app_is_forgotten() {
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        _ = mgr.toggle_scratchpad("k", PAD, |_| unreachable!());
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        _ = mgr.handle_event(AppClosed(2));
+        assert_eq!(mgr.scratchpad_window("k"), None);
+        assert_eq!(mgr.take_scratchpad_to_show(), None);
+    }
+
+    #[test]
+    fn scratchpad_windows_are_skipped_by_focus_floating() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        let other = WindowId::new(3, 1);
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 1)));
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        _ = mgr.handle_event(WindowFocused(vec![space], pad));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(1, 1)));
+
+        // Only the scratchpad floats: nothing to switch to.
+        let response = mgr.handle_command(Some(space), &[space], ToggleFocusFloating);
+        assert_eq!(response.focus_window, None);
+        assert_eq!(response.raise_windows, vec![]);
+
+        let mut floating = win_info();
+        floating.is_standard = false;
+        _ = mgr.handle_event(WindowAdded(space, other, floating));
+        let response = mgr.handle_command(Some(space), &[space], ToggleFocusFloating);
+        assert_eq!(response.focus_window, Some(other));
+        assert_eq!(response.raise_windows, vec![]);
+    }
+
+    #[test]
+    fn scratchpad_window_cannot_be_tiled() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let (mut mgr, space) = scratchpad_manager(None);
+        let pad = WindowId::new(2, 1);
+        _ = mgr.handle_event(WindowAdded(space, pad, pad_info()));
+        _ = mgr.handle_event(WindowFocused(vec![space], pad));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(mgr.floating_windows_in_space(space), [pad].into_iter().collect());
+        assert_eq!(mgr.layout_sorted(space, rect(0, 0, 120, 120)), vec![]);
+    }
+
+    #[test]
+    fn set_config_drops_invalid_rules_and_clamps_frames() {
+        let bad_frame = FractionalRect {
+            x: f64::NAN,
+            y: -1.0,
+            width: 2.0,
+            height: f64::NAN,
+        };
+        let (mut mgr, _) = scratchpad_manager(Some(bad_frame));
+        assert_eq!(mgr.window_rules.len(), 1);
+        assert_eq!(
+            mgr.window_rules[0].frame,
+            Some(FractionalRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.05,
+            })
+        );
+
+        let mut config = Config::default();
+        config.window_rules = vec![
+            app_rule("com.example.X", None, None),
+            app_rule("com.example.Y", Some(false), Some("y")),
+            app_rule("com.example.Z", Some(true), None),
+        ];
+        mgr.set_config(&Arc::new(config));
+        assert_eq!(
+            mgr.window_rules,
+            vec![app_rule("com.example.Z", Some(true), None)]
+        );
     }
 
     impl LayoutManager {

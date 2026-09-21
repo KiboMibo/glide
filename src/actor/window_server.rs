@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::mem;
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
 use tracing::{debug, instrument, warn};
@@ -14,7 +15,8 @@ use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowI
 use crate::actor::{self, reactor, space_manager, wm_controller};
 use crate::collections::HashMap;
 use crate::sys::event::MouseState;
-use crate::sys::screen::{NSScreenInfo, ScreenCache, ScreenInfo, SpaceId};
+use crate::sys::screen::{NSScreenInfo, ScreenCache, ScreenInfo, ScreenSpace, SpaceId};
+use crate::sys::timer::Timer;
 use crate::sys::window_server::{
     self as sys_ws, SkylightConnection, SkylightNotifier, WindowServerId, WindowsOnScreen,
     kCGSWindowIsTerminated,
@@ -25,6 +27,11 @@ use crate::sys::window_server::{
 const LAYER_NORMAL: i32 = 0; // kCGNormalWindowLevel
 const LAYER_FLOATING: i32 = 3; // kCGFloatingWindowLevel
 const LAYER_STATUS: i32 = 8; // kCGStatusWindowLevel (used by some panels)
+
+/// How long after the windows of an app may have changed (it was hidden or
+/// shown, or a window was moved to another space) to check the visible windows
+/// again, in case the window server had not caught up at the first check.
+const VISIBLE_WINDOWS_RECHECK_DELAY: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // WindowServer – off main thread
@@ -39,6 +46,11 @@ pub struct WindowServer {
     sm_tx: space_manager::Sender,
     wm_tx: wm_controller::Sender,
     skylight_tx: SkylightSender,
+    /// Apps whose visible windows are checked again at `recheck_at`.
+    recheck_pids: BTreeSet<pid_t>,
+    /// When to check the visible windows again. Each change postpones it, so a
+    /// burst of changes is checked once.
+    recheck_at: Option<Instant>,
     screen_config_retry_attempt: u8,
     screen_config_retry_pending: bool,
     /// The screen configuration last sent downstream.
@@ -49,7 +61,7 @@ pub struct WindowServer {
 #[derive(Clone, PartialEq)]
 struct ScreenConfig {
     screens: Vec<ScreenInfo>,
-    spaces: Vec<Option<SpaceId>>,
+    spaces: Vec<Option<ScreenSpace>>,
     visible: Vec<WindowServerId>,
 }
 
@@ -94,6 +106,10 @@ pub enum Event {
     /// Sent by SpaceManager when it needs a fresh window list (e.g. after
     /// toggling a space or exiting expose).
     RequestSpaceRefresh,
+    /// The windows of the app may have changed without a notification, e.g.
+    /// after one was moved to another space. Checks the visible windows now and
+    /// again shortly after.
+    RecheckVisibleWindows(pid_t),
 }
 
 pub type Sender = actor::Sender<Event>;
@@ -111,6 +127,8 @@ impl WindowServer {
             sm_tx,
             wm_tx,
             skylight_tx,
+            recheck_pids: BTreeSet::new(),
+            recheck_at: None,
             screen_config_retry_attempt: 0,
             screen_config_retry_pending: false,
             last_screen_config: None,
@@ -118,14 +136,26 @@ impl WindowServer {
     }
 
     pub async fn run(mut self, mut events_rx: Receiver) {
-        while let Some((span, event)) = events_rx.recv().await {
-            let _span = span.entered();
-            self.on_event(event);
+        let mut recheck_timer = Timer::manual();
+        loop {
+            if let Some(at) = self.recheck_at {
+                recheck_timer.set_next_fire(at.saturating_duration_since(Instant::now()));
+            }
+            tokio::select! {
+                event = events_rx.recv() => {
+                    let Some((span, event)) = event else { break };
+                    let _span = span.entered();
+                    self.on_event(event, Instant::now());
+                }
+                _ = recheck_timer.next(), if self.recheck_at.is_some() => {
+                    self.run_due_recheck(Instant::now());
+                }
+            }
         }
     }
 
     #[instrument(skip(self))]
-    fn on_event(&mut self, event: Event) {
+    fn on_event(&mut self, event: Event, now: Instant) {
         match event {
             Event::RegisterWindow(wsid, wid, tx) => {
                 self.skylight_tx.send(SkylightRequest::TrackWindow(wsid, wid, tx));
@@ -141,7 +171,7 @@ impl WindowServer {
                 self.handle_screen_parameters(screens);
             }
             Event::SpaceChanged | Event::RequestSpaceRefresh => {
-                let spaces = self.screen_cache.get_screen_spaces();
+                let spaces = self.send_current_spaces(self.screen_cache.get_current_spaces());
                 let on_screen = self.get_windows_on_screen();
                 self.sm_tx.send(space_manager::Event::SpaceChanged(spaces, on_screen));
             }
@@ -181,7 +211,36 @@ impl WindowServer {
                     visible_windows,
                 });
             }
-            Event::ReactorEvent(event) => self.send_reactor_event(event),
+            Event::ReactorEvent(event) => {
+                let hidden_changed = match event {
+                    reactor::Event::ApplicationHiddenChanged(pid, _) => Some(pid),
+                    _ => None,
+                };
+                self.send_reactor_event(event);
+                if let Some(pid) = hidden_changed {
+                    self.recheck_visible_windows(pid, now);
+                }
+            }
+            Event::RecheckVisibleWindows(pid) => self.recheck_visible_windows(pid, now),
+        }
+    }
+
+    /// Checks the visible windows now, and once more
+    /// `VISIBLE_WINDOWS_RECHECK_DELAY` after the first such call since the
+    /// last recheck. Later calls do not postpone a scheduled recheck.
+    fn recheck_visible_windows(&mut self, pid: pid_t, now: Instant) {
+        self.send_windows_on_screen_if_changed(Some(pid));
+        self.recheck_pids.insert(pid);
+        self.recheck_at.get_or_insert(now + VISIBLE_WINDOWS_RECHECK_DELAY);
+    }
+
+    fn run_due_recheck(&mut self, now: Instant) {
+        if !self.recheck_at.is_some_and(|at| at <= now) {
+            return;
+        }
+        self.recheck_at = None;
+        for pid in mem::take(&mut self.recheck_pids) {
+            self.send_windows_on_screen_if_changed(Some(pid));
         }
     }
 
@@ -202,7 +261,7 @@ impl WindowServer {
         let on_screen = self.get_windows_on_screen();
         let config = ScreenConfig {
             screens,
-            spaces: self.screen_cache.get_screen_spaces(),
+            spaces: self.screen_cache.get_current_spaces(),
             visible: on_screen.visible.clone(),
         };
         if self.last_screen_config.as_ref() == Some(&config) {
@@ -211,6 +270,7 @@ impl WindowServer {
         }
         self.last_screen_config = Some(config.clone());
         let ScreenConfig { screens, spaces, .. } = config;
+        let spaces = self.send_current_spaces(spaces);
 
         self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
             screens: screens.iter().map(|s| s.id).collect(),
@@ -220,6 +280,14 @@ impl WindowServer {
             scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
             on_screen,
         });
+    }
+
+    /// Tells the Reactor which space each screen shows, before the space
+    /// manager reports only the managed ones. Returns the space ids.
+    fn send_current_spaces(&self, spaces: Vec<Option<ScreenSpace>>) -> Vec<Option<SpaceId>> {
+        let ids = spaces.iter().map(|space| space.map(|space| space.id)).collect();
+        self.send_reactor_event(reactor::Event::ScreenSpacesChanged(spaces));
+        ids
     }
 
     fn schedule_screen_config_retry(&mut self) {
@@ -424,6 +492,7 @@ mod tests {
         sm_rx: space_manager::Receiver,
         #[expect(dead_code)]
         skylight_rx: SkylightReceiver,
+        now: Instant,
     }
 
     impl TestHarness {
@@ -432,11 +501,22 @@ mod tests {
             let (wm_tx, _wm_rx) = tokio::sync::mpsc::unbounded_channel();
             let (skylight_tx, skylight_rx) = actor::channel();
             let ws = WindowServer::new(sm_tx, wm_tx, skylight_tx);
-            Self { ws, sm_rx, skylight_rx }
+            Self {
+                ws,
+                sm_rx,
+                skylight_rx,
+                now: Instant::now(),
+            }
         }
 
         fn on_event(&mut self, event: Event) {
-            self.ws.on_event(event);
+            self.ws.on_event(event, self.now);
+        }
+
+        /// Lets `delay` pass and runs the recheck if it is due.
+        fn advance(&mut self, delay: Duration) {
+            self.now += delay;
+            self.ws.run_due_recheck(self.now);
         }
 
         fn drain_sm(&mut self) -> Vec<space_manager::Event> {
@@ -566,6 +646,270 @@ mod tests {
             reactor_events
                 .iter()
                 .any(|e| matches!(e, reactor::Event::WindowBecameVisible(_)))
+        );
+    }
+
+    fn window_ids(on_screen: &WindowsOnScreen) -> Vec<u32> {
+        on_screen.visible.iter().map(|id| id.as_u32()).collect()
+    }
+
+    #[test]
+    fn hiding_an_app_updates_the_visible_windows() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        h.drain_sm();
+
+        set_mock_windows(vec![make_window(2, LAYER_NORMAL)]);
+        h.on_event(Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(
+            1, true,
+        )));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            matches!(
+                reactor_events[..],
+                [
+                    reactor::Event::ApplicationHiddenChanged(1, true),
+                    reactor::Event::WindowsOnScreenUpdated { pid: Some(1), .. },
+                ]
+            ),
+            "{reactor_events:?}"
+        );
+        let updates = find_windows_on_screen_updated(&reactor_events);
+        assert_eq!(window_ids(updates[0]), [2]);
+    }
+
+    fn shown(pid: pid_t) -> Event {
+        Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(pid, false))
+    }
+
+    #[test]
+    fn hidden_change_schedules_a_recheck() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(shown(1));
+        assert_eq!(h.ws.recheck_at, Some(h.now + VISIBLE_WINDOWS_RECHECK_DELAY));
+        h.drain_sm();
+
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY - Duration::from_millis(1));
+        assert!(find_reactor_events(&h.drain_sm()).is_empty(), "not due yet");
+        h.advance(Duration::from_millis(1));
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(1)]);
+        assert_eq!(h.ws.recheck_at, None);
+    }
+
+    #[test]
+    fn a_burst_of_hidden_changes_is_rechecked_once() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        for i in 0..100 {
+            h.on_event(Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(
+                7,
+                i % 2 == 0,
+            )));
+            h.now += Duration::from_millis(1);
+        }
+        h.drain_sm();
+        assert_eq!(h.ws.recheck_pids, [7].into());
+
+        set_mock_windows(vec![]);
+        // The recheck is due a delay after the first change.
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY - Duration::from_millis(101));
+        assert!(find_reactor_events(&h.drain_sm()).is_empty());
+        h.advance(Duration::from_millis(1));
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(7)]);
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY);
+        assert!(find_reactor_events(&h.drain_sm()).is_empty());
+        assert!(h.ws.recheck_pids.is_empty());
+    }
+
+    #[test]
+    fn a_long_series_of_hidden_changes_does_not_postpone_the_recheck() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        let start = h.now;
+        let step = Duration::from_millis(100);
+        let mut rechecks = vec![];
+        for i in 0..20 {
+            let scheduled = h.ws.recheck_at;
+            h.on_event(Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(
+                7,
+                i % 2 == 0,
+            )));
+            if let Some(at) = scheduled {
+                assert_eq!(h.ws.recheck_at, Some(at), "event {i} postponed the recheck");
+            }
+            h.drain_sm();
+            // Another window appears, so each recheck reports a change.
+            set_mock_windows(vec![
+                make_window(1, LAYER_NORMAL),
+                make_window(i + 2, LAYER_NORMAL),
+            ]);
+            h.advance(step);
+            if !updated_pids(&h.drain_sm()).is_empty() {
+                rechecks.push(h.now - start);
+            }
+        }
+        // A series of 2 s is rechecked while it lasts.
+        assert!(rechecks.len() >= 5, "{rechecks:?}");
+        assert!(rechecks[0] <= 2 * VISIBLE_WINDOWS_RECHECK_DELAY, "{rechecks:?}");
+        assert!(
+            rechecks.windows(2).all(|w| w[1] - w[0] <= VISIBLE_WINDOWS_RECHECK_DELAY + step),
+            "{rechecks:?}"
+        );
+    }
+
+    #[test]
+    fn recheck_request_checks_now_and_later() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::RecheckVisibleWindows(3));
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(3)]);
+
+        // The moved window reached the window server late.
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY);
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(3)]);
+    }
+
+    #[test]
+    fn recheck_sends_the_visible_windows_only_if_they_changed() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(shown(1));
+        h.drain_sm();
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY);
+        assert!(find_reactor_events(&h.drain_sm()).is_empty());
+
+        // The shown app's window reached the window server late.
+        h.on_event(shown(1));
+        h.drain_sm();
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY);
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        let updates = find_windows_on_screen_updated(&reactor_events);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(window_ids(updates[0]), [1, 2]);
+    }
+
+    #[test]
+    fn other_reactor_events_do_not_update_the_visible_windows() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::ReactorEvent(reactor::Event::ApplicationActivated(
+            1,
+            Quiet::No,
+        )));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert_eq!(reactor_events.len(), 1);
+        assert!(find_windows_on_screen_updated(&reactor_events).is_empty());
+        assert_eq!(h.ws.recheck_at, None);
+    }
+
+    fn updated_pids(sm_events: &[space_manager::Event]) -> Vec<Option<pid_t>> {
+        find_reactor_events(sm_events)
+            .into_iter()
+            .filter_map(|e| match e {
+                reactor::Event::WindowsOnScreenUpdated { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hidden_change_and_recheck_report_a_partial_update_for_the_app() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(
+            7, false,
+        )));
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(7)]);
+
+        set_mock_windows(vec![]);
+        h.advance(VISIBLE_WINDOWS_RECHECK_DELAY);
+        assert_eq!(updated_pids(&h.drain_sm()), [Some(7)]);
+    }
+
+    #[test]
+    fn space_change_reports_the_current_spaces_before_the_space_change() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        for event in [Event::SpaceChanged, Event::RequestSpaceRefresh] {
+            h.on_event(event);
+            let sm_events = h.drain_sm();
+            assert!(
+                matches!(
+                    sm_events[..],
+                    [
+                        space_manager::Event::ReactorEvent(reactor::Event::ScreenSpacesChanged(_)),
+                        space_manager::Event::SpaceChanged(..),
+                    ]
+                ),
+                "{sm_events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recheck_runs_once_on_the_timer_of_the_running_actor() {
+        use crate::sys::executor::Executor;
+
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let (sm_tx, mut sm_rx) = actor::channel();
+        let (wm_tx, _wm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (skylight_tx, _skylight_rx) = actor::channel();
+        let ws = WindowServer::new(sm_tx, wm_tx, skylight_tx);
+        let (ws_tx, ws_rx) = actor::channel();
+        let mut updates = vec![];
+        Executor::run(async {
+            let drive = async {
+                for _ in 0..5 {
+                    ws_tx.send(Event::RecheckVisibleWindows(4));
+                }
+                Timer::sleep(Duration::from_millis(20)).await;
+                let mut sm_events = vec![];
+                while let Ok((_, event)) = sm_rx.try_recv() {
+                    sm_events.push(event);
+                }
+                // Only the first immediate check found new windows.
+                updates.push(updated_pids(&sm_events));
+
+                // The window server catches up before the delayed check.
+                set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+                Timer::sleep(VISIBLE_WINDOWS_RECHECK_DELAY + Duration::from_millis(250)).await;
+                let mut sm_events = vec![];
+                while let Ok((_, event)) = sm_rx.try_recv() {
+                    sm_events.push(event);
+                }
+                updates.push(updated_pids(&sm_events));
+                drop(ws_tx);
+            };
+            tokio::join!(ws.run(ws_rx), drive);
+        });
+        assert_eq!(updates, [vec![Some(4)], vec![Some(4)]]);
+    }
+
+    #[test]
+    fn hidden_change_without_a_window_change_sends_only_the_event() {
+        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        h.drain_sm();
+        h.on_event(Event::ReactorEvent(reactor::Event::ApplicationHiddenChanged(
+            1, true,
+        )));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            matches!(
+                reactor_events[..],
+                [reactor::Event::ApplicationHiddenChanged(1, true)]
+            ),
+            "{reactor_events:?}"
         );
     }
 }

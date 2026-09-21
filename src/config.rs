@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
+use crate::model::scratchpad::FractionalRect;
 
 pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
@@ -159,7 +160,35 @@ pub struct WindowRule {
     #[serde(rename = "if", default)]
     pub conditions: WindowRuleConditions,
     /// Whether matching windows should float (`true`) or tile (`false`).
-    pub float: bool,
+    #[serde(default)]
+    pub float: Option<bool>,
+    /// Name of the scratchpad that matching windows belong to. Scratchpad
+    /// windows always float.
+    #[serde(default)]
+    pub scratchpad: Option<String>,
+    /// Frame of the scratchpad window as fractions of the active screen.
+    #[serde(default)]
+    pub frame: Option<FractionalRect>,
+}
+
+impl WindowRule {
+    pub(crate) fn validated(mut self) -> Result<Self, String> {
+        match (&self.scratchpad, self.float) {
+            (None, None) => return Err("window rule needs `float` or `scratchpad`".into()),
+            (Some(name), _) if name.trim().is_empty() => {
+                return Err("window rule `scratchpad` must not be empty".into());
+            }
+            (Some(_), Some(false)) => {
+                return Err("window rule with `scratchpad` cannot set `float = false`".into());
+            }
+            (None, _) if self.frame.is_some() => {
+                return Err("window rule `frame` requires `scratchpad`".into());
+            }
+            _ => {}
+        }
+        self.frame = self.frame.map(FractionalRect::validated);
+        Ok(self)
+    }
 }
 
 /// Conditions matched against a window and its application. All specified
@@ -345,17 +374,48 @@ impl ConfigPartial {
                 WmCommandOrDisable::WmCommand(wm_command) => wm_command,
                 WmCommandOrDisable::Disable(_) => continue,
             };
-            let Ok(key) = Hotkey::from_str(&key) else {
+            let Ok(hotkey) = Hotkey::from_str(&key) else {
                 return Err(SpannedError {
                     message: format!("Could not parse hotkey: {key}"),
                     span: None,
                 });
             };
-            keys.push((key, cmd));
+            validate_command(&cmd).map_err(|message| SpannedError {
+                message: format!("keys.{key:?}: {message}"),
+                span: None,
+            })?;
+            keys.push((hotkey, cmd));
+        }
+        let window_rules: Vec<WindowRule> = self
+            .window_rules
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, rule)| {
+                rule.validated().map_err(|message| SpannedError {
+                    message: format!("window_rules[{i}]: {message}"),
+                    span: None,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut scratchpads = FxHashMap::default();
+        for (i, name) in window_rules
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| Some((i, r.scratchpad.as_deref()?)))
+        {
+            if let Some(first) = scratchpads.insert(name, i) {
+                return Err(SpannedError {
+                    message: format!(
+                        "window_rules[{i}]: scratchpad {name:?} is already used by window_rules[{first}]"
+                    ),
+                    span: None,
+                });
+            }
         }
         Ok(Config {
             settings: self.settings.validate()?,
-            window_rules: self.window_rules.unwrap_or_default(),
+            window_rules,
             keys,
         })
     }
@@ -433,6 +493,25 @@ fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
     format!("{}", renderer.render(&[report]))
 }
 
+fn validate_command(cmd: &WmCommand) -> Result<(), String> {
+    use crate::actor::reactor::{Command, ReactorCommand};
+    let WmCommand::ReactorCommand(Command::Reactor(ReactorCommand::ToggleScratchpad {
+        name,
+        launch,
+    })) = cmd
+    else {
+        return Ok(());
+    };
+    if name.trim().is_empty() {
+        return Err("`toggle_scratchpad` name must not be empty".into());
+    }
+    if let Some(launch) = launch {
+        crate::sys::app::validate_bundle_id(launch)
+            .map_err(|e| format!("`toggle_scratchpad` launch: {e}"))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SpannedError {
     message: String,
@@ -504,7 +583,9 @@ mod tests {
                         title_regex: Some("Dialog".parse().unwrap()),
                         ..Default::default()
                     },
-                    float: true,
+                    float: Some(true),
+                    scratchpad: None,
+                    frame: None,
                 },
                 WindowRule {
                     conditions: WindowRuleConditions {
@@ -512,7 +593,9 @@ mod tests {
                         ax_subrole: Some("AXDialog".into()),
                         ..Default::default()
                     },
-                    float: true,
+                    float: Some(true),
+                    scratchpad: None,
+                    frame: None,
                 },
             ]
         );
@@ -536,7 +619,9 @@ mod tests {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
-                float: true,
+                float: Some(true),
+                scratchpad: None,
+                frame: None,
             }]
         );
     }
@@ -553,6 +638,481 @@ mod tests {
             err.message.contains("regex"),
             "unexpected error: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn scratchpad_rule_parses_without_float() {
+        let config = Config::parse(
+            r#"
+            [[window_rules]]
+            if.app_id = "com.example.keyguard"
+            scratchpad = "keyguard"
+            frame = { x = 0.9, y = 0.1, width = 0.5, height = 0.8 }
+
+            [[window_rules]]
+            if.app_id = "com.example.X"
+            scratchpad = "x"
+            float = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.window_rules,
+            vec![
+                WindowRule {
+                    conditions: WindowRuleConditions {
+                        app_id: Some("com.example.keyguard".into()),
+                        ..Default::default()
+                    },
+                    float: None,
+                    scratchpad: Some("keyguard".into()),
+                    frame: Some(FractionalRect {
+                        x: 0.5,
+                        y: 0.1,
+                        width: 0.5,
+                        height: 0.8,
+                    }),
+                },
+                WindowRule {
+                    conditions: WindowRuleConditions {
+                        app_id: Some("com.example.X".into()),
+                        ..Default::default()
+                    },
+                    float: Some(true),
+                    scratchpad: Some("x".into()),
+                    frame: None,
+                },
+            ]
+        );
+    }
+
+    #[track_caller]
+    fn assert_rule_rejected(rule: &str, expected: &str) {
+        let err = Config::parse(&format!("[[window_rules]]\n{rule}")).unwrap_err();
+        assert!(
+            err.message.contains(expected),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn window_rule_without_action_is_rejected() {
+        assert_rule_rejected(r#"if.app_id = "com.example.X""#, "needs `float` or `scratchpad`");
+    }
+
+    #[test]
+    fn scratchpad_rule_with_float_false_is_rejected() {
+        assert_rule_rejected("scratchpad = \"k\"\nfloat = false", "cannot set `float = false`");
+    }
+
+    #[test]
+    fn frame_without_scratchpad_is_rejected() {
+        assert_rule_rejected(
+            "float = true\nframe = { x = 0.1, y = 0.1, width = 0.8, height = 0.8 }",
+            "`frame` requires `scratchpad`",
+        );
+    }
+
+    #[test]
+    fn empty_scratchpad_name_is_rejected() {
+        assert_rule_rejected(r#"scratchpad = """#, "must not be empty");
+    }
+
+    #[test]
+    fn blank_scratchpad_name_is_rejected() {
+        assert_rule_rejected(r#"scratchpad = " \t ""#, "must not be empty");
+    }
+
+    fn parse_single_rule(rule: &str) -> WindowRule {
+        let mut rules = Config::parse(&format!("[[window_rules]]\n{rule}")).unwrap().window_rules;
+        assert_eq!(rules.len(), 1);
+        rules.pop().unwrap()
+    }
+
+    #[test]
+    fn scratchpad_rule_in_inline_array_parses() {
+        let config = Config::parse(r#"window_rules = [{ scratchpad = "k" }]"#).unwrap();
+        assert_eq!(
+            config.window_rules,
+            vec![WindowRule {
+                conditions: WindowRuleConditions::default(),
+                float: None,
+                scratchpad: Some("k".into()),
+                frame: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn scratchpad_frame_non_finite_values_are_clamped() {
+        let rule = parse_single_rule(
+            "scratchpad = \"k\"\nframe = { x = nan, y = -inf, width = inf, height = 0.5 }",
+        );
+        assert_eq!(
+            rule.frame,
+            Some(FractionalRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.5,
+            })
+        );
+    }
+
+    #[test]
+    fn scratchpad_frame_negative_values_are_clamped() {
+        let rule = parse_single_rule(
+            "scratchpad = \"k\"\nframe = { x = -0.2, y = -1, width = -0.5, height = 0.3 }",
+        );
+        assert_eq!(
+            rule.frame,
+            Some(FractionalRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.05,
+                height: 0.3,
+            })
+        );
+    }
+
+    #[test]
+    fn scratchpad_frame_with_unknown_field_is_rejected() {
+        assert!(
+            Config::parse(
+                "[[window_rules]]\nscratchpad = \"k\"\n\
+                 frame = { x = 0.1, y = 0.1, width = 0.8, height = 0.8, depth = 1 }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scratchpad_frame_with_missing_field_is_rejected() {
+        assert!(
+            Config::parse(
+                "[[window_rules]]\nscratchpad = \"k\"\nframe = { x = 0.1, y = 0.1, width = 0.8 }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scratchpad_rule_with_float_true_and_frame_is_accepted() {
+        let rule = parse_single_rule(
+            "scratchpad = \"k\"\nfloat = true\nframe = { x = 0.2, y = 0.1, width = 0.6, height = 0.8 }",
+        );
+        assert_eq!(rule.float, Some(true));
+        assert_eq!(rule.scratchpad.as_deref(), Some("k"));
+        assert_eq!(
+            rule.frame,
+            Some(FractionalRect {
+                x: 0.2,
+                y: 0.1,
+                width: 0.6,
+                height: 0.8,
+            })
+        );
+    }
+
+    #[test]
+    fn frame_with_float_false_and_no_scratchpad_is_rejected() {
+        assert_rule_rejected(
+            "float = false\nframe = { x = 0.1, y = 0.1, width = 0.8, height = 0.8 }",
+            "`frame` requires `scratchpad`",
+        );
+    }
+
+    #[test]
+    fn frame_alone_is_rejected() {
+        let err = Config::parse(
+            "[[window_rules]]\nframe = { x = 0.1, y = 0.1, width = 0.8, height = 0.8 }",
+        )
+        .unwrap_err();
+        assert!(err.message.starts_with("window_rules[0]: "), "{}", err.message);
+    }
+
+    #[test]
+    fn empty_scratchpad_name_with_float_false_is_rejected() {
+        assert!(Config::parse("[[window_rules]]\nscratchpad = \"\"\nfloat = false").is_err());
+    }
+
+    #[test]
+    fn non_string_scratchpad_name_is_rejected() {
+        assert!(Config::parse("[[window_rules]]\nscratchpad = 5").is_err());
+        assert!(Config::parse("[[window_rules]]\nscratchpad = true").is_err());
+    }
+
+    #[test]
+    fn window_rule_error_names_the_invalid_rule() {
+        let err = Config::parse(
+            r#"
+            [[window_rules]]
+            float = true
+
+            [[window_rules]]
+            if.app_id = "com.example.X"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.starts_with("window_rules[1]: "),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn legacy_float_rules_still_parse_after_scratchpad_rules() {
+        let config = Config::parse(
+            r#"
+            [[window_rules]]
+            if.app_id = "com.example.K"
+            scratchpad = "k"
+
+            [[window_rules]]
+            if.app_id = "com.example.X"
+            float = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.window_rules.len(), 2);
+        assert_eq!(config.window_rules[1].float, Some(false));
+        assert_eq!(config.window_rules[1].scratchpad, None);
+        assert_eq!(config.window_rules[1].frame, None);
+    }
+
+    #[test]
+    fn two_rules_with_the_same_scratchpad_name_are_rejected() {
+        let err = Config::parse(
+            r#"
+            [[window_rules]]
+            if.app_id = "com.example.A"
+            scratchpad = "k"
+
+            [[window_rules]]
+            if.app_id = "com.example.X"
+            float = true
+
+            [[window_rules]]
+            if.app_id = "com.example.B"
+            scratchpad = "k"
+            frame = { x = 0, y = 0, width = 0.5, height = 0.5 }
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            r#"window_rules[2]: scratchpad "k" is already used by window_rules[0]"#
+        );
+    }
+
+    #[test]
+    fn rules_with_different_scratchpad_names_are_accepted() {
+        let config = Config::parse(
+            r#"
+            [[window_rules]]
+            if.app_id = "com.example.A"
+            scratchpad = "a"
+
+            [[window_rules]]
+            if.app_id = "com.example.B"
+            scratchpad = "b"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.window_rules.len(), 2);
+    }
+
+    fn parse_toggle(args: &str) -> Result<Config, SpannedError> {
+        Config::parse(&format!(
+            "[keys]\n\"Meta + Alt + K\" = {{ toggle_scratchpad = {{ {args} }} }}"
+        ))
+    }
+
+    #[test]
+    fn toggle_scratchpad_with_blank_name_is_rejected() {
+        for name in ["", "  \t"] {
+            let err = parse_toggle(&format!("name = {name:?}")).unwrap_err();
+            assert!(err.message.contains("name must not be empty"), "{}", err.message);
+            assert!(
+                err.message.starts_with(r#"keys."Meta + Alt + K": "#),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_scratchpad_with_invalid_launch_is_rejected() {
+        for launch in ["", "-a", "com.example app", "com.example;rm", "$(id)"] {
+            let err = parse_toggle(&format!("name = \"k\", launch = {launch:?}")).unwrap_err();
+            assert!(
+                err.message.contains("`toggle_scratchpad` launch"),
+                "{launch:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_scratchpad_with_valid_launch_is_accepted() {
+        parse_toggle(r#"name = "k", launch = "com.example.my-app2""#).unwrap();
+        parse_toggle(r#"name = "k""#).unwrap();
+    }
+
+    #[test]
+    fn toggle_scratchpad_without_name_is_rejected() {
+        assert!(
+            Config::parse(
+                r#"
+                [keys]
+                "Meta + Alt + K" = { toggle_scratchpad = { launch = "com.x" } }
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn toggle_scratchpad_with_unknown_field_is_rejected() {
+        assert!(
+            Config::parse(
+                r#"
+                [keys]
+                "Meta + Alt + K" = { toggle_scratchpad = { name = "k", lanch = "com.x" } }
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn toggle_scratchpad_round_trips_through_serde() {
+        let cmd = crate::actor::reactor::ReactorCommand::ToggleScratchpad {
+            name: "k".into(),
+            launch: Some("com.x".into()),
+        };
+        let text = ron::to_string(&ReactorCommand::Reactor(cmd)).unwrap();
+        let parsed: ReactorCommand = ron::from_str(&text).unwrap();
+        let ReactorCommand::Reactor(crate::actor::reactor::ReactorCommand::ToggleScratchpad {
+            name,
+            launch,
+        }) = parsed
+        else {
+            panic!("unexpected command: {parsed:?} from {text}");
+        };
+        assert_eq!(name, "k");
+        assert_eq!(launch.as_deref(), Some("com.x"));
+    }
+
+    #[test]
+    fn toggle_scratchpad_command_parses() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            default_keys = false
+
+            [keys]
+            "Meta + Alt + K" = { toggle_scratchpad = { name = "k", launch = "com.x" } }
+            "Meta + Alt + J" = { toggle_scratchpad = { name = "j" } }
+            "#,
+        )
+        .unwrap();
+        let cmd = |key: &str| {
+            &config
+                .keys
+                .iter()
+                .find(|(hk, _)| hk.to_string() == key)
+                .unwrap_or_else(|| panic!("{key} should be present"))
+                .1
+        };
+        let WmCommand::ReactorCommand(ReactorCommand::Reactor(
+            crate::actor::reactor::ReactorCommand::ToggleScratchpad { name, launch },
+        )) = cmd("Alt + Meta + KeyK")
+        else {
+            panic!("unexpected command: {:?}", cmd("Alt + Meta + KeyK"));
+        };
+        assert_eq!(name, "k");
+        assert_eq!(launch.as_deref(), Some("com.x"));
+
+        let WmCommand::ReactorCommand(ReactorCommand::Reactor(
+            crate::actor::reactor::ReactorCommand::ToggleScratchpad { name, launch },
+        )) = cmd("Alt + Meta + KeyJ")
+        else {
+            panic!("unexpected command: {:?}", cmd("Alt + Meta + KeyJ"));
+        };
+        assert_eq!(name, "j");
+        assert_eq!(launch, &None);
+    }
+
+    /// The commented-out `toggle_scratchpad` key and the example window rules
+    /// in the default config, uncommented.
+    fn default_config_scratchpad_examples() -> String {
+        let text = include_str!("../glide.default.toml");
+        let key = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("# \""))
+            .find(|line| line.contains("toggle_scratchpad ="))
+            .expect("an example key with toggle_scratchpad");
+        let mut examples = format!("[keys]\n\"{key}\n");
+        let mut in_rule = false;
+        for line in text.lines() {
+            if line == "#   [[window_rules]]" {
+                in_rule = true;
+            }
+            match line.strip_prefix("#   ") {
+                Some(rule_line) if in_rule => examples.extend([rule_line, "\n"]),
+                _ => in_rule = false,
+            }
+        }
+        examples
+    }
+
+    #[test]
+    fn default_config_scratchpad_examples_parse() {
+        let examples = default_config_scratchpad_examples();
+        let config = Config::parse(&examples).unwrap_or_else(|e| panic!("{e:?}\n{examples}"));
+
+        let commands: Vec<_> = config
+            .keys
+            .iter()
+            .filter_map(|(key, cmd)| match cmd {
+                WmCommand::ReactorCommand(ReactorCommand::Reactor(
+                    crate::actor::reactor::ReactorCommand::ToggleScratchpad { name, launch },
+                )) => Some((key.to_string(), name.as_str(), launch.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            [(
+                "Alt + Meta + KeyK".to_owned(),
+                "keyguard",
+                Some("com.artemchep.keyguard")
+            )]
+        );
+
+        assert!(config.window_rules.len() > 1, "{examples}");
+        let scratchpad_rules: Vec<_> =
+            config.window_rules.iter().filter(|rule| rule.scratchpad.is_some()).collect();
+        assert_eq!(
+            scratchpad_rules,
+            [&WindowRule {
+                conditions: WindowRuleConditions {
+                    app_id: Some("com.artemchep.keyguard".into()),
+                    ..Default::default()
+                },
+                float: None,
+                scratchpad: Some("keyguard".into()),
+                frame: Some(FractionalRect {
+                    x: 0.2,
+                    y: 0.1,
+                    width: 0.6,
+                    height: 0.8,
+                }),
+            }]
         );
     }
 

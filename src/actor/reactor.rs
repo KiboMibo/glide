@@ -10,13 +10,14 @@
 mod animation;
 mod main_window;
 mod replay;
+mod system;
 
 #[cfg(test)]
 mod restore_snapshots;
 #[cfg(test)]
 mod testing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{mem, thread};
@@ -28,6 +29,7 @@ use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use system::{LiveSystem, NoSystem, SystemActions};
 use tokio::sync::mpsc;
 use tracing::{Span, debug, error, info, instrument, trace, warn};
 
@@ -40,10 +42,13 @@ use crate::actor::{group_bars, space_manager, status, window_server, wm_controll
 use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
+use crate::model::scratchpad::{
+    FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState,
+};
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
-use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::screen::{CoordinateConverter, ScreenSpace, SpaceId};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
@@ -90,6 +95,12 @@ pub enum Event {
     /// sending SpaceChanged.
     SpaceChanged(Vec<Option<SpaceId>>, WindowsOnScreen),
 
+    /// The space each screen shows, including spaces that are not managed.
+    ///
+    /// Sent just before `ScreenParametersChanged` and `SpaceChanged`, in the
+    /// order of their screens.
+    ScreenSpacesChanged(Vec<Option<ScreenSpace>>),
+
     /// All running apps at launch have been registered.
     StartupComplete,
 
@@ -114,9 +125,19 @@ pub enum Event {
     ApplicationThreadTerminated(pid_t),
     ApplicationActivated(pid_t, Quiet),
     ApplicationDeactivated(pid_t),
+    /// The application was hidden (`true`) or shown (`false`).
+    ApplicationHiddenChanged(pid_t, bool),
     ApplicationGloballyActivated(pid_t),
     ApplicationGloballyDeactivated(pid_t),
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
+
+    /// A scratchpad window that a launch should show is no longer expected:
+    /// the launch failed or the window did not appear in time.
+    ScratchpadShowExpired(PendingShowId),
+
+    /// Moving a scratchpad window to the current space was not confirmed in
+    /// time, or could not be started. The window is shown where it is.
+    ScratchpadMoveEnded(SpaceMoveId),
 
     WindowsDiscovered {
         pid: pid_t,
@@ -215,11 +236,19 @@ pub enum Command {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReactorCommand {
     Debug,
     Serialize,
     SaveAndExit,
+    /// Shows or hides the scratchpad window with the given name.
+    ToggleScratchpad {
+        name: String,
+        /// Bundle id to launch when there is no window. Without it, the
+        /// command only logs a warning when there is no window.
+        #[serde(default)]
+        launch: Option<String>,
+    },
 }
 
 pub struct Reactor {
@@ -234,6 +263,9 @@ pub struct Reactor {
     window_ids: HashMap<WindowServerId, WindowId>,
     visible_windows: HashSet<WindowServerId>,
     screens: Vec<Screen>,
+    /// The space each screen shows, from the last `ScreenSpacesChanged`.
+    /// Unlike `Screen::space`, this includes spaces that are not managed.
+    screen_spaces: Vec<Option<ScreenSpace>>,
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
     in_drag: bool,
@@ -245,7 +277,14 @@ pub struct Reactor {
     /// Recent attempts to write a frame to a window, used to stop fighting apps
     /// that move their windows back.
     frame_attempts: HashMap<WindowId, FrameAttempt>,
+    /// Scratchpad windows being moved to the current space. Each is placed and
+    /// focused once it is on screen or its move ends.
+    pending_space_moves: BTreeMap<WindowId, PendingSpaceMove>,
+    next_space_move_id: u64,
     record: Record,
+    /// Only [`Reactor::spawn`] installs one that acts on the system, so tests
+    /// and replays never do.
+    system: Box<dyn SystemActions>,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
     mouse_tx: Option<mouse::Sender>,
@@ -267,7 +306,7 @@ struct FrameAttempt {
 
 #[derive(Debug)]
 struct AppState {
-    #[allow(unused)]
+    /// `info.is_hidden` follows [`Event::ApplicationHiddenChanged`].
     pub info: AppInfo,
     pub handle: AppThreadHandle,
 }
@@ -291,6 +330,17 @@ struct Screen {
     frame: CGRect,
     space: Option<SpaceId>,
     scale_factor: f64,
+}
+
+/// Identifies one move of a scratchpad window to the current space.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceMoveId(u64);
+
+/// A scratchpad window that is shown once its move to the current space ends.
+#[derive(Debug)]
+struct PendingSpaceMove {
+    id: SpaceMoveId,
+    frame: FractionalRect,
 }
 
 /// A per-window counter that tracks the last time the reactor sent a request to
@@ -364,13 +414,17 @@ impl Reactor {
             .spawn(move || {
                 let mut reactor =
                     Reactor::new(config.clone(), layout, record, group_indicators_tx.clone());
+                let (delayed_tx, delayed_rx) = crate::actor::channel();
+                reactor.system =
+                    Box::new(LiveSystem::new(reactor_tx.clone(), ws_tx.clone(), delayed_tx));
+                let delayed_events = system::run_delayed_events(delayed_rx, reactor_tx.clone());
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
                     one_space,
                     config,
                     reactor_tx.clone(),
-                    ws_tx,
+                    ws_tx.clone(),
                     wm_tx.clone(),
                     status_tx,
                     group_indicators_tx,
@@ -382,6 +436,7 @@ impl Reactor {
                         reactor.run(events, reactor_tx),
                         space_manager.run(sm_rx),
                         window_server.run(ws_rx),
+                        delayed_events,
                     );
                 });
             })
@@ -408,12 +463,16 @@ impl Reactor {
             window_server_info: HashMap::default(),
             visible_windows: HashSet::default(),
             screens: vec![],
+            screen_spaces: vec![],
             active_screen_idx: None,
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
             resizing_window: None,
             frame_attempts: HashMap::default(),
+            pending_space_moves: BTreeMap::new(),
+            next_space_move_id: 0,
             record,
+            system: Box::new(NoSystem),
             raise_manager_tx,
             animation_tx: None,
             mouse_tx: None,
@@ -504,8 +563,45 @@ impl Reactor {
                 }
             }
             Event::ApplicationThreadTerminated(pid) => {
-                self.apps.remove(&pid);
+                if let Some(app) = self.apps.remove(&pid)
+                    && let Some(bundle_id) = &app.info.bundle_id
+                {
+                    self.layout.cancel_scratchpad_shows_for_app(bundle_id);
+                }
+                self.pending_space_moves.retain(|wid, _| wid.pid != pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
+            }
+            Event::ScratchpadMoveEnded(id) => {
+                if let Some((&wid, _)) = self.pending_space_moves.iter().find(|(_, m)| m.id == id) {
+                    let moved = self.pending_space_moves.remove(&wid).unwrap();
+                    debug!(?wid, "Showing scratchpad window without waiting for its move");
+                    self.place_scratchpad(wid, moved.frame);
+                }
+            }
+            Event::ScratchpadShowExpired(id) => {
+                if let Some(name) = self.layout.cancel_scratchpad_show(id) {
+                    info!(
+                        name,
+                        "Scratchpad window was not shown: it did not appear in time"
+                    );
+                }
+            }
+            Event::ScreenSpacesChanged(spaces) => self.screen_spaces = spaces,
+            Event::ApplicationHiddenChanged(pid, hidden) => {
+                if let Some(app) = self.apps.get_mut(&pid) {
+                    // Only a shown app becoming hidden cancels its moves; the
+                    // unhide sent by a show is reported before any later hide.
+                    if hidden && !app.info.is_hidden {
+                        self.pending_space_moves.retain(|wid, _| {
+                            let keep = wid.pid != pid;
+                            if !keep {
+                                debug!(?wid, "Not showing scratchpad window: its app was hidden");
+                            }
+                            keep
+                        });
+                    }
+                    app.info.is_hidden = hidden;
+                }
             }
             Event::ApplicationActivated(..)
             | Event::ApplicationDeactivated(..)
@@ -531,18 +627,27 @@ impl Reactor {
                     // a drag is in progress.
                 }
             }
-            Event::WindowsOnScreenUpdated { pid, on_screen } => match pid {
-                Some(_) => self.update_partial_window_server_info(on_screen),
-                None => self.update_complete_window_server_info(on_screen),
-            },
+            Event::WindowsOnScreenUpdated { pid, on_screen } => {
+                match pid {
+                    Some(_) => self.update_partial_window_server_info(on_screen),
+                    None => self.update_complete_window_server_info(on_screen),
+                }
+                self.place_moved_scratchpads();
+            }
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
-                    && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
                     && let Some(info) = self.layout_window_info(wid)
                 {
-                    animation_focus_wids.push(wid);
-                    self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
+                    match self.best_space_for_window(&window.frame_monotonic) {
+                        Some(space) => {
+                            animation_focus_wids.push(wid);
+                            self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
+                        }
+                        None => self.send_layout_event(LayoutEvent::ScratchpadCandidates(vec![(
+                            wid, info,
+                        )])),
+                    }
                 }
             }
             Event::WindowDestroyed(wid) => {
@@ -552,6 +657,7 @@ impl Reactor {
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.pending_space_moves.remove(&wid);
                 self.frame_attempts.remove(&wid);
                 //animation_focus_wid = self.window_order.last().cloned();
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
@@ -655,6 +761,7 @@ impl Reactor {
                     }
                 }
                 self.update_active_screen();
+                self.place_moved_scratchpads();
                 // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from
@@ -706,6 +813,7 @@ impl Reactor {
                     self.send_layout_event(LayoutEvent::WindowFocused(spaces, main_window));
                 }
                 self.update_active_screen();
+                self.place_moved_scratchpads();
                 self.update_visible_windows();
             }
             Event::LeftMouseDown(point) => {
@@ -867,6 +975,9 @@ impl Reactor {
                     }
                 }
             }
+            Event::Command(Command::Reactor(ReactorCommand::ToggleScratchpad { name, launch })) => {
+                self.toggle_scratchpad(&name, launch.as_deref());
+            }
             Event::ConfigChanged(config) => {
                 self.layout.set_config(&config);
                 self.config = config;
@@ -964,13 +1075,32 @@ impl Reactor {
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
-        for wid in self
+        // The layout takes the first matching window as a scratchpad: prefer
+        // the main window, then visible windows, wherever they are.
+        let main_window = self.main_window_tracker.app_main_window(pid);
+        let mut candidates = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|wid| wid.pid == pid && self.window_is_tracked(*wid))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|wid| {
+            (Some(*wid) != main_window, !self.window_is_visible(*wid), *wid)
+        });
+        let candidates = candidates
+            .into_iter()
+            .filter_map(|wid| Some((wid, self.layout_window_info(wid)?)))
+            .collect();
+        self.send_layout_event(LayoutEvent::ScratchpadCandidates(candidates));
+
+        let wids = self
             .visible_windows
             .iter()
             .flat_map(|wsid| self.window_ids.get(wsid).copied())
             .filter(|wid| wid.pid == pid)
             .filter(|wid| self.window_is_tracked(*wid))
-        {
+            .collect::<BTreeSet<_>>();
+        for wid in wids {
             let Some(window) = self.windows.get(&wid) else { continue };
             let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
                 continue;
@@ -1055,6 +1185,15 @@ impl Reactor {
         self.screens.get(self.active_screen_idx.unwrap_or(0) as usize)
     }
 
+    /// Whether the window server reports the window on screen. Windows without
+    /// a window server id count as visible.
+    fn window_is_visible(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .and_then(|window| window.window_server_id)
+            .is_none_or(|wsid| self.visible_windows.contains(&wsid))
+    }
+
     fn window_is_tracked(&self, _id: WindowId) -> bool {
         // For now we track all windows in the reactor and let the LayoutManager
         // decide what to keep.
@@ -1077,7 +1216,22 @@ impl Reactor {
         self.handle_layout_response_with_context(response, ResponseContext::default());
     }
 
+    /// Every response from [`LayoutManager::handle_event`] goes through here,
+    /// which is where the scratchpads it wants shown are taken.
     fn handle_layout_response_with_context(
+        &mut self,
+        response: layout::EventResponse,
+        context: ResponseContext,
+    ) {
+        let to_show =
+            std::iter::from_fn(|| self.layout.take_scratchpad_to_show()).collect::<Vec<_>>();
+        self.apply_layout_response(response, context);
+        for (wid, frame) in to_show {
+            self.show_scratchpad(wid, frame);
+        }
+    }
+
+    fn apply_layout_response(
         &mut self,
         mut response: layout::EventResponse,
         ResponseContext {
@@ -1171,6 +1325,154 @@ impl Reactor {
             response.raise_windows.clear();
         }
         response
+    }
+
+    fn toggle_scratchpad(&mut self, name: &str, launch: Option<&str>) {
+        let state =
+            self.layout.scratchpad_window(name).map(|wid| self.scratchpad_window_state(wid));
+        let action = self.layout.toggle_scratchpad(name, launch, |wid| {
+            state.unwrap_or_else(|| {
+                error!(?wid, name, "No state for the scratchpad window; showing it");
+                ScratchpadWindowState {
+                    app_hidden: true,
+                    focused: false,
+                    on_active_space: false,
+                }
+            })
+        });
+        info!(name, ?state, ?action, "Toggling scratchpad");
+        match action {
+            ScratchpadAction::Launch => {
+                let (Some(bundle_id), Some(id)) =
+                    (launch, self.layout.pending_scratchpad_show(name))
+                else {
+                    warn!(name, "Scratchpad has no window and no `launch` to open one");
+                    return;
+                };
+                if let Err(err) = self.system.launch_app(name, bundle_id, id) {
+                    error!(name, bundle_id, "Could not launch scratchpad app: {err}");
+                    // A replay does not launch, so it needs the outcome in the
+                    // trace to make the same decision.
+                    self.record.on_event(&Event::ScratchpadShowExpired(id));
+                    self.layout.cancel_scratchpad_show(id);
+                }
+            }
+            ScratchpadAction::Show(wid) => {
+                let frame = self.layout.scratchpad_frame(wid).unwrap_or(FractionalRect::DEFAULT);
+                self.show_scratchpad(wid, frame);
+            }
+            ScratchpadAction::Hide(wid) => self.set_app_hidden(wid.pid, true),
+        }
+    }
+
+    fn scratchpad_window_state(&self, wid: WindowId) -> ScratchpadWindowState {
+        let window = self.windows.get(&wid);
+        let on_screen = self.window_is_visible(wid);
+        let on_active_screen = window
+            .and_then(|window| self.best_screen_idx_for_window(&window.frame_monotonic))
+            .is_some_and(|idx| idx == self.active_screen_idx.unwrap_or(0) as usize);
+        ScratchpadWindowState {
+            app_hidden: self.is_app_hidden(wid.pid),
+            focused: self.main_window() == Some(wid),
+            on_active_space: on_screen && on_active_screen,
+        }
+    }
+
+    /// Unhides the app if needed, places the window on the active screen and
+    /// focuses it. Does not wait for the app to report that it is shown.
+    fn show_scratchpad(&mut self, wid: WindowId, frame: FractionalRect) {
+        if self.is_app_hidden(wid.pid) {
+            self.set_app_hidden(wid.pid, false);
+        }
+        if !self.window_is_visible(wid)
+            && let Some(app) = self.apps.get(&wid.pid)
+        {
+            _ = app.handle.send(Request::Unminimize(wid));
+        }
+        self.pending_space_moves.remove(&wid);
+        if let Some((wsid, space)) = self.space_move_target(wid) {
+            let id = SpaceMoveId(self.next_space_move_id);
+            self.next_space_move_id += 1;
+            match self.system.move_window_to_space(wid, wsid, space, id) {
+                Ok(()) => {
+                    debug!(
+                        ?wid,
+                        ?space,
+                        ?id,
+                        "Moving scratchpad window to the current space"
+                    );
+                    self.pending_space_moves.insert(wid, PendingSpaceMove { id, frame });
+                    return;
+                }
+                Err(err) => {
+                    debug!(?wid, "Not moving scratchpad window: {err}");
+                    // A replay does not try the move, so it needs the outcome
+                    // in the trace to make the same decision.
+                    self.record.on_event(&Event::ScratchpadMoveEnded(id));
+                }
+            }
+        }
+        self.place_scratchpad(wid, frame);
+    }
+
+    /// The window server id of the window and the space to move it to, if it
+    /// may be on another space. A hidden app's windows are not on screen
+    /// wherever they are, so they are moved too; moving a window to its own
+    /// space does nothing.
+    fn space_move_target(&self, wid: WindowId) -> Option<(WindowServerId, SpaceId)> {
+        let wsid = self.windows.get(&wid)?.window_server_id?;
+        if self.visible_windows.contains(&wsid) && !self.is_app_hidden(wid.pid) {
+            return None;
+        }
+        let screen = self.active_screen_idx.unwrap_or(0) as usize;
+        let space = (*self.screen_spaces.get(screen)?)?;
+        if space.fullscreen {
+            debug!(
+                ?wid,
+                ?space,
+                "Not moving scratchpad window to a fullscreen space"
+            );
+            return None;
+        }
+        Some((wsid, space.id))
+    }
+
+    /// Places and focuses the moved scratchpad windows that are on screen now.
+    fn place_moved_scratchpads(&mut self) {
+        let arrived: Vec<WindowId> = self
+            .pending_space_moves
+            .keys()
+            .copied()
+            .filter(|&wid| self.window_is_visible(wid))
+            .collect();
+        for wid in arrived {
+            let moved = self.pending_space_moves.remove(&wid).unwrap();
+            self.place_scratchpad(wid, moved.frame);
+        }
+    }
+
+    /// Places the window on the active screen and focuses it.
+    fn place_scratchpad(&mut self, wid: WindowId, frame: FractionalRect) {
+        let frame_overrides = self
+            .active_screen()
+            .map(|screen| vec![(wid, frame.to_frame(screen.frame))])
+            .unwrap_or_default();
+        self.handle_layout_response(layout::EventResponse {
+            frame_overrides,
+            raise_windows: vec![],
+            focus_window: Some(wid),
+        });
+    }
+
+    fn set_app_hidden(&self, pid: pid_t, hidden: bool) {
+        if let Some(app) = self.apps.get(&pid) {
+            _ = app.handle.send(Request::SetHidden(hidden));
+        }
+    }
+
+    /// Whether the application is hidden. False for unknown applications.
+    pub fn is_app_hidden(&self, pid: pid_t) -> bool {
+        self.apps.get(&pid).is_some_and(|app| app.info.is_hidden)
     }
 
     /// The main window of the active app, if any.
@@ -1355,6 +1657,2548 @@ pub mod tests {
             animation_rx.try_recv(),
             Ok(animation::Message::Replace(_))
         ));
+    }
+
+    mod scratchpad {
+        use std::sync::Mutex;
+
+        use pretty_assertions::assert_eq;
+        use test_log::test;
+
+        use super::*;
+        use crate::config::{WindowRule, WindowRuleConditions};
+        use crate::sys::window_server::WindowServerInfo;
+
+        const SCREEN: CGRect = CGRect {
+            origin: CGPoint { x: 0., y: 0. },
+            size: CGSize { width: 1000., height: 1000. },
+        };
+        const FRAME: FractionalRect = FractionalRect {
+            x: 0.1,
+            y: 0.2,
+            width: 0.5,
+            height: 0.4,
+        };
+        /// `FRAME` on `SCREEN`.
+        const SHOWN: CGRect = CGRect {
+            origin: CGPoint { x: 100., y: 200. },
+            size: CGSize { width: 500., height: 400. },
+        };
+        fn tiled() -> WindowId {
+            WindowId::new(1, 1)
+        }
+        fn pad() -> WindowId {
+            WindowId::new(2, 1)
+        }
+        fn launched_pad() -> WindowId {
+            WindowId::new(3, 1)
+        }
+
+        fn rule(app_id: &str, name: &str, frame: Option<FractionalRect>) -> WindowRule {
+            WindowRule {
+                conditions: WindowRuleConditions {
+                    app_id: Some(app_id.into()),
+                    ..Default::default()
+                },
+                float: None,
+                scratchpad: Some(name.into()),
+                frame,
+            }
+        }
+
+        fn config(window_rules: Vec<WindowRule>) -> Arc<Config> {
+            let mut config = Config::default();
+            config.settings.default_disable = false;
+            config.settings.animate = false;
+            config.window_rules = window_rules;
+            Arc::new(config)
+        }
+
+        fn toggle(name: &str, launch: Option<&str>) -> Event {
+            Event::Command(Command::Reactor(ReactorCommand::ToggleScratchpad {
+                name: name.into(),
+                launch: launch.map(Into::into),
+            }))
+        }
+
+        /// Records the actions it is asked to perform.
+        #[derive(Default, Clone)]
+        struct FakeSystem {
+            launches: Arc<Mutex<Vec<String>>>,
+            launch_ids: Arc<Mutex<Vec<PendingShowId>>>,
+            moves: Arc<Mutex<Vec<(WindowId, SpaceId, SpaceMoveId)>>>,
+            moves_unsupported: Arc<Mutex<bool>>,
+            launches_fail: Arc<Mutex<bool>>,
+        }
+
+        impl SystemActions for FakeSystem {
+            fn launch_app(
+                &mut self,
+                _name: &str,
+                bundle_id: &str,
+                id: PendingShowId,
+            ) -> Result<(), crate::sys::app::LaunchError> {
+                crate::sys::app::validate_bundle_id(bundle_id)?;
+                if *self.launches_fail.lock().unwrap() {
+                    return Err(crate::sys::app::LaunchError::Spawn("no threads".into()));
+                }
+                self.launches.lock().unwrap().push(bundle_id.to_owned());
+                self.launch_ids.lock().unwrap().push(id);
+                Ok(())
+            }
+
+            fn move_window_to_space(
+                &mut self,
+                wid: WindowId,
+                wsid: WindowServerId,
+                space: SpaceId,
+                id: SpaceMoveId,
+            ) -> Result<(), crate::sys::space_move::SpaceMoveError> {
+                assert!(wsid.as_u32() > 0);
+                if *self.moves_unsupported.lock().unwrap() {
+                    return Err(crate::sys::space_move::SpaceMoveError::Unsupported);
+                }
+                self.moves.lock().unwrap().push((wid, space, id));
+                Ok(())
+            }
+        }
+
+        struct Test {
+            apps: Apps,
+            reactor: Reactor,
+            system: FakeSystem,
+            raise_rx: mpsc::UnboundedReceiver<(Span, raise::Event)>,
+            windows: Vec<(pid_t, WindowInfo)>,
+        }
+
+        impl Test {
+            /// App 1 has two tiled windows and is focused. App 2
+            /// (`com.testapp2`) has the scratchpad window "k". App 3
+            /// (`com.testapp3`) is not running and has the scratchpad "l".
+            fn new() -> Test {
+                Self::with_rules(vec![
+                    rule("com.testapp2", "k", Some(FRAME)),
+                    rule("com.testapp3", "l", Some(FRAME)),
+                ])
+            }
+
+            fn with_rules(rules: Vec<WindowRule>) -> Test {
+                let mut reactor = reactor_with_one_screen();
+                reactor.handle_event(Event::ConfigChanged(config(rules)));
+                let (raise_manager_tx, raise_rx) = mpsc::unbounded_channel();
+                reactor.raise_manager_tx = raise_manager_tx;
+                let system = FakeSystem::default();
+                reactor.system = Box::new(system.clone());
+                let mut test = Test {
+                    apps: Apps::new(),
+                    reactor,
+                    system,
+                    raise_rx,
+                    windows: vec![],
+                };
+                test.launch(1, make_windows(2), true);
+                test.launch(2, vec![make_window(5)], false);
+                test.reactor.handle_event(Event::StartupComplete);
+                test.settle();
+                test
+            }
+
+            fn launch(&mut self, pid: pid_t, windows: Vec<WindowInfo>, focus: bool) {
+                self.windows.extend(windows.iter().map(|w| (pid, w.clone())));
+                let main = windows.first().map(|_| WindowId::new(pid, 1));
+                let events = self.apps.make_app_with_opts(pid, windows, main, focus);
+                self.reactor.handle_events(events);
+                self.update_on_screen(|_| true);
+                if focus {
+                    self.focus_app(pid);
+                }
+            }
+
+            fn focus_app(&mut self, pid: pid_t) {
+                self.reactor.handle_event(Event::ApplicationActivated(pid, Quiet::No));
+                self.reactor.handle_event(Event::ApplicationGloballyActivated(pid));
+            }
+
+            /// Sends the complete list of visible windows.
+            fn update_on_screen(&mut self, visible: impl Fn(WindowServerId) -> bool) {
+                let info = self
+                    .windows
+                    .iter()
+                    .filter_map(|(pid, w)| {
+                        let id = w.sys_id?;
+                        visible(id).then_some(WindowServerInfo {
+                            pid: *pid,
+                            id,
+                            layer: 0,
+                            frame: w.frame,
+                        })
+                    })
+                    .collect();
+                self.reactor.handle_event(Event::WindowsOnScreenUpdated {
+                    pid: None,
+                    on_screen: WindowsOnScreen::new(info),
+                });
+            }
+
+            fn settle(&mut self) {
+                self.apps.simulate_until_quiet(&mut self.reactor);
+                while self.raise_rx.try_recv().is_ok() {}
+            }
+
+            fn focus_requests(&mut self) -> Vec<WindowId> {
+                let mut focus = vec![];
+                while let Ok((_, msg)) = self.raise_rx.try_recv() {
+                    if let raise::Event::RaiseRequest(req) = msg {
+                        focus.extend(req.focus_window.map(|(wid, _)| wid));
+                    }
+                }
+                focus
+            }
+
+            fn launches(&self) -> Vec<String> {
+                self.system.launches.lock().unwrap().clone()
+            }
+
+            fn last_launch_id(&self) -> PendingShowId {
+                *self.system.launch_ids.lock().unwrap().last().expect("a launch")
+            }
+
+            fn moves(&self) -> Vec<(WindowId, SpaceId, SpaceMoveId)> {
+                self.system.moves.lock().unwrap().clone()
+            }
+
+            fn set_screen_spaces(&mut self, spaces: Vec<Option<ScreenSpace>>) {
+                self.reactor.handle_event(Event::ScreenSpacesChanged(spaces));
+            }
+
+            fn hide_pad(&mut self) {
+                self.focus_app(2);
+                self.reactor.handle_event(toggle("k", None));
+                self.settle();
+                assert!(self.reactor.is_app_hidden(2));
+            }
+        }
+
+        fn has_frame(requests: &[(pid_t, Request)], wid: WindowId, frame: CGRect) -> bool {
+            requests.iter().any(|(_, req)| {
+                matches!(req, Request::SetWindowFrame(w, f, _) if *w == wid && *f == frame)
+            })
+        }
+
+        fn has_set_hidden(requests: &[(pid_t, Request)], pid: pid_t, hidden: bool) -> bool {
+            requests
+                .iter()
+                .any(|(p, req)| *p == pid && matches!(req, Request::SetHidden(h) if *h == hidden))
+        }
+
+        #[test]
+        fn scratchpad_window_floats_outside_the_tree() {
+            let t = Test::new();
+            let space = SpaceId::new(1);
+            assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(pad()));
+            assert_eq!(
+                t.reactor.layout.floating_windows_in_space(space),
+                [pad()].into_iter().collect()
+            );
+            let frames = window_frames(&t.reactor);
+            let half = |x| CGRect::new(CGPoint::new(x, 0.), CGSize::new(500., 1000.));
+            assert_eq!(frames[0], (tiled(), half(0.)));
+            assert_eq!(frames[1], (WindowId::new(1, 2), half(500.)));
+            assert_eq!(frames[2], (pad(), make_window(5).frame), "not laid out");
+        }
+
+        #[test]
+        fn toggle_hides_the_visible_focused_window() {
+            let mut t = Test::new();
+            t.focus_app(2);
+            t.settle();
+            t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+            let requests = t.apps.tagged_requests();
+            assert!(
+                matches!(requests[..], [(2, Request::SetHidden(true))]),
+                "{requests:?}"
+            );
+            assert!(t.launches().is_empty());
+            assert!(t.focus_requests().is_empty());
+        }
+
+        #[test]
+        fn toggle_shows_the_hidden_app_with_the_rule_frame() {
+            let mut t = Test::new();
+            t.hide_pad();
+            t.focus_app(1);
+
+            t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+            // Nothing answers the unhide here; showing must not wait for it.
+            let requests = t.apps.tagged_requests();
+            assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+            assert!(has_frame(&requests, pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [pad()]);
+            assert!(t.launches().is_empty());
+            assert!(
+                !requests.iter().any(|(pid, _)| *pid == 1),
+                "tiled windows are left alone: {requests:?}"
+            );
+        }
+
+        #[test]
+        fn toggle_shows_a_manually_hidden_app() {
+            let mut t = Test::new();
+            t.focus_app(2);
+            t.reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+            t.settle();
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+            assert!(has_frame(&requests, pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [pad()]);
+        }
+
+        #[test]
+        fn toggle_shows_an_unfocused_window_without_unhiding() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            assert!(
+                !requests.iter().any(|(_, r)| matches!(r, Request::SetHidden(_))),
+                "{requests:?}"
+            );
+            assert!(has_frame(&requests, pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [pad()]);
+        }
+
+        #[test]
+        fn toggle_unminimizes_a_window_that_is_not_on_screen() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("k", None));
+            t.settle();
+            assert!(t.apps.unminimized.is_empty(), "the window is visible");
+
+            // A minimized window is not on screen.
+            t.update_on_screen(|wsid| wsid != WindowServerId::new(5));
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            assert!(
+                requests.iter().any(|(pid, r)| *pid == 2 && matches!(r, Request::Unminimize(w) if *w == pad())),
+                "{requests:?}"
+            );
+            assert_eq!(t.focus_requests(), [pad()]);
+        }
+
+        #[test]
+        fn toggle_shows_a_focused_window_that_is_not_on_screen() {
+            // A window on another space is missing from the visible windows.
+            let mut t = Test::new();
+            t.focus_app(2);
+            t.update_on_screen(|wsid| wsid != WindowServerId::new(5));
+            t.settle();
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            assert!(has_frame(&requests, pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [pad()]);
+            assert!(!has_set_hidden(&requests, 2, true), "{requests:?}");
+        }
+
+        #[test]
+        fn toggle_twice_hides_the_window_it_showed() {
+            let mut t = Test::new();
+            t.hide_pad();
+            t.focus_app(1);
+            t.reactor.handle_event(toggle("k", None));
+            t.settle();
+            assert!(!t.reactor.is_app_hidden(2));
+            // The raise made the scratchpad app active.
+            t.focus_app(2);
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            assert!(
+                matches!(requests[..], [(2, Request::SetHidden(true))]),
+                "{requests:?}"
+            );
+        }
+
+        #[test]
+        fn toggle_launches_and_shows_the_window_when_it_appears() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            assert_eq!(t.launches(), ["com.testapp3"]);
+            assert!(t.apps.tagged_requests().is_empty());
+            assert!(t.focus_requests().is_empty());
+
+            t.launch(3, vec![make_window(7)], false);
+            let requests = t.apps.tagged_requests();
+            assert!(has_frame(&requests, launched_pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [launched_pad()]);
+            assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+            let events = t.apps.simulate_events_for_tagged_requests(requests);
+            t.reactor.handle_events(events);
+
+            // The window is shown once.
+            t.reactor.handle_event(Event::WindowsDiscovered {
+                pid: 3,
+                new: vec![],
+                known_visible: vec![launched_pad()],
+            });
+            assert!(t.focus_requests().is_empty());
+            assert_eq!(t.launches(), ["com.testapp3"]);
+        }
+
+        #[test]
+        fn window_created_after_launch_is_shown() {
+            let mut t = Test::new();
+            t.launch(3, vec![], false);
+            t.settle();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            assert_eq!(t.launches(), ["com.testapp3"]);
+
+            let window = make_window(7);
+            t.windows.push((3, window.clone()));
+            t.reactor
+                .handle_event(Event::WindowCreated(launched_pad(), window, MouseState::Up));
+            t.update_on_screen(|_| true);
+            t.reactor.handle_event(Event::WindowBecameVisible(launched_pad()));
+            let requests = t.apps.tagged_requests();
+            assert!(has_frame(&requests, launched_pad(), SHOWN), "{requests:?}");
+            assert_eq!(t.focus_requests(), [launched_pad()]);
+        }
+
+        #[test]
+        fn toggle_without_window_or_launch_only_warns() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", None));
+            t.reactor.handle_event(toggle("unknown", None));
+            assert!(t.launches().is_empty());
+            assert!(t.apps.tagged_requests().is_empty());
+            assert!(t.focus_requests().is_empty());
+
+            // The window is not shown when the app is opened by other means.
+            t.launch(3, vec![make_window(7)], false);
+            assert!(t.focus_requests().is_empty());
+            assert!(!has_frame(&t.apps.tagged_requests(), launched_pad(), SHOWN));
+        }
+
+        #[test]
+        fn failed_launch_does_not_show_the_window_later() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("-a")));
+            assert!(t.launches().is_empty());
+            t.launch(3, vec![make_window(7)], false);
+            assert!(t.focus_requests().is_empty());
+        }
+
+        #[test]
+        fn window_appearing_after_the_show_expired_is_not_shown() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            let id = t.last_launch_id();
+            assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), Some(id));
+            t.reactor.handle_event(Event::ScratchpadShowExpired(id));
+
+            t.launch(3, vec![make_window(7)], false);
+            assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+            assert!(t.focus_requests().is_empty());
+            assert!(!has_frame(&t.apps.tagged_requests(), launched_pad(), SHOWN));
+        }
+
+        #[test]
+        fn window_appearing_in_time_is_shown_once() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            let id = t.last_launch_id();
+            t.launch(3, vec![make_window(7)], false);
+            assert_eq!(t.focus_requests(), [launched_pad()]);
+            t.settle();
+
+            // The expiry of a show that already happened changes nothing.
+            t.reactor.handle_event(Event::ScratchpadShowExpired(id));
+            t.reactor.handle_event(Event::WindowsDiscovered {
+                pid: 3,
+                new: vec![],
+                known_visible: vec![launched_pad()],
+            });
+            assert!(t.focus_requests().is_empty());
+            assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+        }
+
+        #[test]
+        fn expiry_of_an_earlier_launch_keeps_a_later_one() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            let first = t.last_launch_id();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            assert_ne!(t.last_launch_id(), first);
+            t.reactor.handle_event(Event::ScratchpadShowExpired(first));
+
+            t.launch(3, vec![make_window(7)], false);
+            assert_eq!(t.focus_requests(), [launched_pad()]);
+        }
+
+        #[test]
+        fn quitting_the_launched_app_drops_the_pending_show() {
+            let mut t = Test::new();
+            t.launch(3, vec![], false);
+            t.settle();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            t.reactor.handle_event(toggle("k2", Some("com.testapp2")));
+            assert!(t.reactor.layout.pending_scratchpad_show("l").is_some());
+            t.reactor.handle_event(Event::ApplicationTerminated(3));
+            t.reactor.handle_event(Event::ApplicationThreadTerminated(3));
+            t.settle();
+            assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), None);
+            assert!(
+                t.reactor.layout.pending_scratchpad_show("k2").is_some(),
+                "shows that launched other apps are kept"
+            );
+        }
+
+        #[test]
+        fn failed_launch_is_recorded_and_replayed() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("m", Some("com.testapp4")));
+            *t.system.launches_fail.lock().unwrap() = true;
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), None);
+            let trace = replay::tests::recorded_trace(&mut t.reactor);
+            assert!(trace.contains("ScratchpadShowExpired"), "{trace}");
+            let mut replayed = replay::tests::replay_trace(&trace);
+            assert_eq!(replayed.layout.pending_scratchpad_show("l"), None);
+            assert_eq!(
+                replayed.layout.pending_scratchpad_show("m"),
+                t.reactor.layout.pending_scratchpad_show("m")
+            );
+            assert!(t.reactor.layout.pending_scratchpad_show("m").is_some());
+
+            // The window that appears later is shown by neither.
+            for reactor in [&mut t.reactor, &mut replayed] {
+                let mut apps = Apps::new();
+                let events = apps.make_app_with_opts(3, vec![make_window(7)], None, false);
+                reactor.handle_events(events);
+                assert!(!apps.requests().iter().any(|r| matches!(r, Request::SetWindowFrame(..))));
+            }
+        }
+
+        #[test]
+        fn show_expiry_is_recorded_and_replayed() {
+            let mut t = Test::new();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            t.reactor.handle_event(toggle("m", Some("com.testapp4")));
+            let id = t.last_launch_id();
+            t.reactor.handle_event(Event::ScratchpadShowExpired(id));
+            let trace = replay::tests::recorded_trace(&mut t.reactor);
+            assert!(trace.contains("ScratchpadShowExpired"), "{trace}");
+            let replayed = replay::tests::replay_trace(&trace);
+            assert!(replayed.layout.pending_scratchpad_show("l").is_some());
+            assert_eq!(replayed.layout.pending_scratchpad_show("m"), None);
+        }
+
+        #[test]
+        fn destroyed_window_and_terminated_app_are_forgotten() {
+            let mut t = Test::new();
+            t.reactor.handle_event(Event::WindowDestroyed(pad()));
+            assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+            t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+            assert_eq!(t.launches(), ["com.testapp2"]);
+
+            t.launch(3, vec![make_window(7)], false);
+            t.settle();
+            assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+            t.reactor.handle_event(Event::ApplicationTerminated(3));
+            t.reactor.handle_event(Event::ApplicationThreadTerminated(3));
+            t.settle();
+            assert_eq!(t.reactor.layout.scratchpad_window("l"), None);
+        }
+
+        #[test]
+        fn toggle_focus_floating_skips_scratchpad_windows() {
+            let mut t = Test::new();
+            // Focusing the scratchpad must not make it the floating window to
+            // return to.
+            t.focus_app(2);
+            t.focus_app(1);
+            t.settle();
+            t.reactor.handle_event(Event::Command(Command::Layout(
+                LayoutCommand::ToggleFocusFloating,
+            )));
+            assert!(t.focus_requests().is_empty());
+            assert!(t.apps.tagged_requests().is_empty());
+        }
+
+        #[test]
+        fn toggle_window_floating_keeps_scratchpad_floating() {
+            let mut t = Test::new();
+            t.focus_app(2);
+            t.settle();
+            t.reactor.handle_event(Event::Command(Command::Layout(
+                LayoutCommand::ToggleWindowFloating,
+            )));
+            t.settle();
+            assert_eq!(
+                t.reactor.layout.floating_windows_in_space(SpaceId::new(1)),
+                [pad()].into_iter().collect()
+            );
+            assert_eq!(window_frames(&t.reactor)[2], (pad(), make_window(5).frame));
+        }
+
+        #[test]
+        fn invalid_rules_from_ipc_are_sanitized() {
+            let bad_frame = FractionalRect {
+                x: f64::NAN,
+                y: 0.5,
+                width: f64::INFINITY,
+                height: 0.5,
+            };
+            let blank_name = rule("com.testapp1", " ", None);
+            let mut t =
+                Test::with_rules(vec![blank_name, rule("com.testapp2", "k", Some(bad_frame))]);
+            t.reactor.handle_event(toggle("k", None));
+            let requests = t.apps.tagged_requests();
+            let bottom_half = CGRect::new(CGPoint::new(0., 500.), CGSize::new(1000., 500.));
+            assert!(has_frame(&requests, pad(), bottom_half), "{requests:?}");
+            // The rule with a blank name is dropped, so app 1 still tiles.
+            assert_eq!(
+                t.reactor.layout.floating_windows_in_space(SpaceId::new(1)),
+                [pad()].into_iter().collect()
+            );
+        }
+
+        #[test]
+        fn default_frame_is_used_without_frame() {
+            let mut t = Test::with_rules(vec![rule("com.testapp2", "k", None)]);
+            t.reactor.handle_event(toggle("k", None));
+            let default = FractionalRect::DEFAULT.to_frame(SCREEN);
+            let requests = t.apps.tagged_requests();
+            assert!(has_frame(&requests, pad(), default), "{requests:?}");
+        }
+
+        #[test]
+        fn toggle_is_recorded_and_replayed_without_launching() {
+            let mut t = Test::new();
+            t.hide_pad();
+            t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+            let trace = replay::tests::recorded_trace(&mut t.reactor);
+            assert!(trace.contains("toggle_scratchpad"), "{trace}");
+            let replayed = replay::tests::replay_trace(&trace);
+            assert_eq!(replayed.layout.scratchpad_window("k"), Some(pad()));
+            assert!(replayed.is_app_hidden(2));
+        }
+
+        mod space_moves {
+            use pretty_assertions::assert_eq;
+            use test_log::test;
+
+            use super::edge_cases::{frames_of, window_at};
+            use super::*;
+
+            fn current(id: u64) -> Option<ScreenSpace> {
+                Some(ScreenSpace {
+                    id: SpaceId::new(id),
+                    fullscreen: false,
+                })
+            }
+
+            fn fullscreen(id: u64) -> Option<ScreenSpace> {
+                Some(ScreenSpace {
+                    id: SpaceId::new(id),
+                    fullscreen: true,
+                })
+            }
+
+            fn not_on_screen(wsid: WindowServerId) -> bool {
+                wsid != WindowServerId::new(5)
+            }
+
+            /// The scratchpad window is on another space of the screen.
+            fn pad_on_another_space() -> Test {
+                let mut t = Test::new();
+                t.set_screen_spaces(vec![current(1)]);
+                t.update_on_screen(not_on_screen);
+                t.settle();
+                t
+            }
+
+            #[test]
+            fn window_on_another_space_is_moved_and_then_shown() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                assert_eq!(t.moves().len(), 1);
+                assert_eq!(t.moves()[0].0, pad());
+                assert_eq!(t.moves()[0].1, SpaceId::new(1));
+                let requests = t.apps.tagged_requests();
+                assert!(frames_of(&requests, pad()).is_empty(), "{requests:?}");
+                assert!(t.focus_requests().is_empty());
+                assert!(t.launches().is_empty());
+
+                // Other windows changing does not end the wait.
+                t.update_on_screen(|wsid| not_on_screen(wsid) && wsid != WindowServerId::new(1));
+                assert!(t.focus_requests().is_empty());
+
+                t.update_on_screen(|_| true);
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+
+                // The window is shown once.
+                t.update_on_screen(|_| true);
+                assert!(t.focus_requests().is_empty());
+                assert!(t.reactor.pending_space_moves.is_empty());
+            }
+
+            #[test]
+            fn partial_window_update_ends_the_wait() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", None));
+                t.reactor.handle_event(Event::WindowsOnScreenUpdated {
+                    pid: Some(2),
+                    on_screen: WindowsOnScreen::new(vec![WindowServerInfo {
+                        pid: 2,
+                        id: WindowServerId::new(5),
+                        layer: 0,
+                        frame: make_window(5).frame,
+                    }]),
+                });
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn move_timeout_shows_the_window_without_the_move() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", None));
+                let first = t.moves()[0].2;
+                // A second toggle before the window arrives starts a new move.
+                t.reactor.handle_event(toggle("k", None));
+                let second = t.moves()[1].2;
+                assert_ne!(first, second);
+
+                t.reactor.handle_event(Event::ScratchpadMoveEnded(first));
+                assert!(
+                    t.focus_requests().is_empty(),
+                    "an older move ending changes nothing"
+                );
+                assert!(frames_of(&t.apps.tagged_requests(), pad()).is_empty());
+
+                t.reactor.handle_event(Event::ScratchpadMoveEnded(second));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+
+                t.reactor.handle_event(Event::ScratchpadMoveEnded(second));
+                assert!(t.focus_requests().is_empty());
+            }
+
+            #[test]
+            fn unsupported_move_shows_the_window_at_once() {
+                let mut t = pad_on_another_space();
+                *t.system.moves_unsupported.lock().unwrap() = true;
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+                assert!(t.reactor.pending_space_moves.is_empty());
+
+                let trace = replay::tests::recorded_trace(&mut t.reactor);
+                assert!(trace.contains("ScratchpadMoveEnded"), "{trace}");
+                let replayed = replay::tests::replay_trace(&trace);
+                assert!(replayed.pending_space_moves.is_empty());
+            }
+
+            #[test]
+            fn window_is_not_moved_to_a_fullscreen_space() {
+                let mut t = pad_on_another_space();
+                t.set_screen_spaces(vec![fullscreen(1)]);
+                t.reactor.handle_event(toggle("k", None));
+                assert!(t.moves().is_empty());
+                assert_eq!(frames_of(&t.apps.tagged_requests(), pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn window_is_not_moved_without_a_current_space() {
+                let mut t = pad_on_another_space();
+                t.set_screen_spaces(vec![None]);
+                t.reactor.handle_event(toggle("k", None));
+                assert!(t.moves().is_empty());
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn visible_window_is_not_moved() {
+                let mut t = Test::new();
+                t.set_screen_spaces(vec![current(1)]);
+                t.reactor.handle_event(toggle("k", None));
+                assert!(t.moves().is_empty());
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn hidden_app_window_is_moved_unhidden_and_shown() {
+                let mut t = Test::new();
+                t.set_screen_spaces(vec![current(1)]);
+                t.hide_pad();
+                t.focus_app(1);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                assert_eq!(t.moves().len(), 1);
+                let requests = t.apps.tagged_requests();
+                assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+                assert!(frames_of(&requests, pad()).is_empty(), "{requests:?}");
+                assert!(t.focus_requests().is_empty());
+
+                // The window server reports the window once the app is shown.
+                t.update_on_screen(|_| true);
+                assert_eq!(frames_of(&t.apps.tagged_requests(), pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn window_is_moved_to_the_space_of_the_active_screen() {
+                let mut t = Test::two_screens_with(make_window(5));
+                t.set_screen_spaces(vec![current(1), current(2)]);
+                t.launch(4, vec![window_at(9, 1300.)], true);
+                t.update_on_screen(not_on_screen);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                assert_eq!(t.moves()[0].1, SpaceId::new(2));
+            }
+
+            #[test]
+            fn window_is_moved_to_a_current_space_that_is_not_managed() {
+                let mut t = pad_on_another_space();
+                t.refresh(vec![None]);
+                t.update_on_screen(not_on_screen);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                assert_eq!(t.moves().len(), 1);
+                assert_eq!(t.moves()[0].1, SpaceId::new(1));
+            }
+
+            #[test]
+            fn launched_window_on_another_space_is_moved() {
+                let mut t = Test::new();
+                t.set_screen_spaces(vec![current(1)]);
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                // The app opens its window on another space.
+                let window = make_window(7);
+                t.windows.push((3, window.clone()));
+                t.update_on_screen(|wsid| wsid != WindowServerId::new(7));
+                let events =
+                    t.apps.make_app_without_ws_info(3, vec![window], Some(launched_pad()), false);
+                t.reactor.handle_events(events);
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert_eq!(t.moves().len(), 1);
+                assert_eq!(t.moves()[0].0, launched_pad());
+                assert!(t.focus_requests().is_empty());
+
+                t.update_on_screen(|_| true);
+                assert_eq!(frames_of(&t.apps.tagged_requests(), launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn destroyed_window_is_not_shown_after_its_move() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", None));
+                let id = t.moves()[0].2;
+                t.reactor.handle_event(Event::WindowDestroyed(pad()));
+                assert!(t.reactor.pending_space_moves.is_empty());
+                t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                assert!(t.focus_requests().is_empty());
+            }
+
+            #[test]
+            fn quitting_the_app_drops_its_move() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", None));
+                t.reactor.handle_event(Event::ApplicationTerminated(2));
+                t.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+                assert!(t.reactor.pending_space_moves.is_empty());
+            }
+
+            #[test]
+            fn replay_makes_the_same_decisions_without_moving() {
+                let mut t = pad_on_another_space();
+                t.reactor.handle_event(toggle("k", None));
+                let id = t.moves()[0].2;
+                let trace = replay::tests::recorded_trace(&mut t.reactor);
+                assert!(trace.contains("ScreenSpacesChanged"), "{trace}");
+                let replayed = replay::tests::replay_trace(&trace);
+                assert_eq!(replayed.pending_space_moves.keys().collect::<Vec<_>>(), [&pad()]);
+                assert_eq!(replayed.pending_space_moves[&pad()].id, id);
+
+                t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                let trace = replay::tests::recorded_trace(&mut t.reactor);
+                let replayed = replay::tests::replay_trace(&trace);
+                assert!(replayed.pending_space_moves.is_empty());
+                assert_eq!(t.moves().len(), 1, "only the live reactor moved the window");
+            }
+
+            /// Events that arrive while a scratchpad window is being moved.
+            mod races {
+                use pretty_assertions::assert_eq;
+                use test_log::test;
+
+                use super::*;
+
+                fn move_ids(t: &Test) -> Vec<SpaceMoveId> {
+                    t.moves().into_iter().map(|(_, _, id)| id).collect()
+                }
+
+                fn pending(t: &Test) -> Vec<(WindowId, SpaceMoveId)> {
+                    t.reactor.pending_space_moves.iter().map(|(wid, m)| (*wid, m.id)).collect()
+                }
+
+                fn on_screen(
+                    t: &Test,
+                    visible: impl Fn(WindowServerId) -> bool,
+                ) -> WindowsOnScreen {
+                    WindowsOnScreen::new(
+                        t.windows
+                            .iter()
+                            .filter_map(|(pid, w)| {
+                                let id = w.sys_id?;
+                                visible(id).then_some(WindowServerInfo {
+                                    pid: *pid,
+                                    id,
+                                    layer: 0,
+                                    frame: w.frame,
+                                })
+                            })
+                            .collect(),
+                    )
+                }
+
+                fn screen_changed(t: &Test, visible: impl Fn(WindowServerId) -> bool) -> Event {
+                    Event::ScreenParametersChanged {
+                        frames: vec![SCREEN],
+                        spaces: vec![Some(SpaceId::new(1))],
+                        scale_factors: vec![2.0],
+                        converter: CoordinateConverter::default(),
+                        on_screen: on_screen(t, visible),
+                    }
+                }
+
+                /// App 3 runs with the scratchpad "l" window on another space,
+                /// like the "k" window of app 2.
+                fn two_pads_on_other_spaces() -> Test {
+                    let mut t = Test::new();
+                    t.set_screen_spaces(vec![current(1)]);
+                    t.launch(3, vec![make_window(7)], false);
+                    t.update_on_screen(|wsid| {
+                        wsid != WindowServerId::new(5) && wsid != WindowServerId::new(7)
+                    });
+                    t.settle();
+                    assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                    t
+                }
+
+                #[test]
+                fn toggle_during_a_move_moves_again_without_hiding_or_launching() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                    t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                    let requests = t.apps.tagged_requests();
+                    assert!(!has_set_hidden(&requests, 2, true), "{requests:?}");
+                    assert!(t.launches().is_empty());
+                    let ids = move_ids(&t);
+                    assert_eq!(ids.len(), 2);
+                    assert_eq!(pending(&t), [(pad(), ids[1])]);
+
+                    t.update_on_screen(|_| true);
+                    assert_eq!(frames_of(&t.apps.tagged_requests(), pad()), [SHOWN]);
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    // Neither move ending shows the window again.
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(ids[0]));
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(ids[1]));
+                    assert!(t.focus_requests().is_empty());
+                }
+
+                #[test]
+                fn toggle_after_the_window_arrived_hides_it() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.update_on_screen(|_| true);
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    t.focus_app(2);
+                    t.settle();
+
+                    t.reactor.handle_event(toggle("k", None));
+                    let requests = t.apps.tagged_requests();
+                    assert!(has_set_hidden(&requests, 2, true), "{requests:?}");
+                    assert_eq!(move_ids(&t).len(), 1);
+                }
+
+                #[test]
+                fn window_closed_during_a_move_is_not_shown_by_later_updates() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    t.reactor.handle_event(Event::WindowDestroyed(pad()));
+                    // The window server still lists the closed window.
+                    t.update_on_screen(|_| true);
+                    t.reactor.handle_event(screen_changed(&t, |_| true));
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    assert!(t.focus_requests().is_empty());
+                    assert!(frames_of(&t.apps.tagged_requests(), pad()).is_empty());
+                }
+
+                #[test]
+                fn app_hidden_during_a_move_cancels_the_show() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+                    assert!(pending(&t).is_empty());
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    assert!(frames_of(&t.apps.tagged_requests(), pad()).is_empty());
+                    assert!(t.focus_requests().is_empty());
+
+                    // The user shows the app on the current space.
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(2, false));
+                    t.update_on_screen(|_| true);
+                    assert!(frames_of(&t.apps.tagged_requests(), pad()).is_empty());
+                    assert!(t.focus_requests().is_empty());
+
+                    let trace = replay::tests::recorded_trace(&mut t.reactor);
+                    let replayed = replay::tests::replay_trace(&trace);
+                    assert!(replayed.pending_space_moves.is_empty());
+                }
+
+                #[test]
+                fn hiding_another_app_during_a_move_keeps_the_wait() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+                    assert_eq!(pending(&t), [(pad(), id)]);
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                }
+
+                #[test]
+                fn unhiding_a_hidden_app_for_its_move_keeps_the_wait() {
+                    let mut t = Test::new();
+                    t.set_screen_spaces(vec![current(1)]);
+                    t.hide_pad();
+                    t.focus_app(1);
+                    t.settle();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    // A report of the earlier hide arrives before the unhide.
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+                    assert_eq!(pending(&t), [(pad(), id)]);
+                    // The app reports the unhide, and the shown state again.
+                    t.settle();
+                    assert!(!t.reactor.is_app_hidden(2));
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(2, false));
+                    assert_eq!(pending(&t), [(pad(), id)]);
+
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    assert_eq!(frames_of(&t.apps.tagged_requests(), pad()), [SHOWN]);
+                    assert_eq!(t.focus_requests(), [pad()]);
+                }
+
+                #[test]
+                fn hiding_the_app_after_it_was_unhidden_for_its_move_cancels_the_show() {
+                    let mut t = Test::new();
+                    t.set_screen_spaces(vec![current(1)]);
+                    t.hide_pad();
+                    t.focus_app(1);
+                    t.settle();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    t.settle();
+                    t.reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+                    assert!(pending(&t).is_empty());
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    t.update_on_screen(|_| true);
+                    assert!(frames_of(&t.apps.tagged_requests(), pad()).is_empty());
+                    assert!(t.focus_requests().is_empty());
+                }
+
+                #[test]
+                fn space_change_that_shows_the_window_ends_the_wait() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.set_screen_spaces(vec![current(2)]);
+                    t.reactor.handle_event(Event::SpaceChanged(
+                        vec![Some(SpaceId::new(2))],
+                        on_screen(&t, |_| true),
+                    ));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    assert!(pending(&t).is_empty());
+                    assert_eq!(move_ids(&t).len(), 1);
+                }
+
+                #[test]
+                fn space_change_without_the_window_keeps_waiting() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    t.set_screen_spaces(vec![current(3)]);
+                    t.reactor.handle_event(Event::SpaceChanged(
+                        vec![Some(SpaceId::new(3))],
+                        on_screen(&t, not_on_screen),
+                    ));
+                    assert!(t.focus_requests().is_empty());
+                    assert_eq!(pending(&t), [(pad(), id)]);
+
+                    // The next toggle moves the window to the new current space.
+                    t.reactor.handle_event(toggle("k", None));
+                    assert_eq!(t.moves()[1].1, SpaceId::new(3));
+                }
+
+                #[test]
+                fn screen_change_that_shows_the_window_ends_the_wait() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.reactor.handle_event(screen_changed(&t, not_on_screen));
+                    assert!(t.focus_requests().is_empty());
+                    assert_eq!(pending(&t).len(), 1);
+
+                    t.reactor.handle_event(screen_changed(&t, |_| true));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    assert!(pending(&t).is_empty());
+                }
+
+                #[test]
+                fn toggle_that_shows_at_once_drops_the_earlier_wait() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    let id = move_ids(&t)[0];
+                    // The user is now on a fullscreen space, so the window is
+                    // shown where it is.
+                    t.set_screen_spaces(vec![fullscreen(2)]);
+                    t.reactor.handle_event(toggle("k", None));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    assert!(pending(&t).is_empty());
+
+                    t.update_on_screen(|_| true);
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+                    assert!(t.focus_requests().is_empty(), "shown only once");
+                }
+
+                #[test]
+                fn two_scratchpads_wait_and_end_independently() {
+                    let mut t = two_pads_on_other_spaces();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                    assert!(t.launches().is_empty());
+                    let moves = t.moves();
+                    assert_eq!(
+                        moves.iter().map(|(wid, space, _)| (*wid, *space)).collect::<Vec<_>>(),
+                        [(pad(), SpaceId::new(1)), (launched_pad(), SpaceId::new(1))]
+                    );
+                    let (k_id, l_id) = (moves[0].2, moves[1].2);
+                    assert_ne!(k_id, l_id);
+
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(k_id));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    assert_eq!(pending(&t), [(launched_pad(), l_id)]);
+
+                    t.update_on_screen(|wsid| wsid == WindowServerId::new(7));
+                    let requests = t.apps.tagged_requests();
+                    assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                    assert_eq!(t.focus_requests(), [launched_pad()]);
+                    assert!(pending(&t).is_empty());
+                }
+
+                #[test]
+                fn two_scratchpads_arriving_together_are_both_shown() {
+                    let mut t = two_pads_on_other_spaces();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.reactor.handle_event(toggle("l", None));
+                    t.update_on_screen(|_| true);
+                    let requests = t.apps.tagged_requests();
+                    assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                    assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                    let mut focused = t.focus_requests();
+                    focused.sort();
+                    assert_eq!(focused, [pad(), launched_pad()]);
+                    assert!(pending(&t).is_empty());
+                }
+
+                #[test]
+                fn quitting_one_app_keeps_the_move_of_another() {
+                    let mut t = two_pads_on_other_spaces();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.reactor.handle_event(toggle("l", None));
+                    let k_id = move_ids(&t)[0];
+                    t.reactor.handle_event(Event::ApplicationTerminated(3));
+                    t.reactor.handle_event(Event::ApplicationThreadTerminated(3));
+                    assert_eq!(pending(&t), [(pad(), k_id)]);
+                }
+
+                #[test]
+                fn move_ids_stay_unique_after_a_failed_move() {
+                    let mut t = pad_on_another_space();
+                    *t.system.moves_unsupported.lock().unwrap() = true;
+                    t.reactor.handle_event(toggle("k", None));
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    *t.system.moves_unsupported.lock().unwrap() = false;
+                    t.reactor.handle_event(toggle("k", None));
+                    // The failed move took id 0; a stale end of it must not
+                    // show the window early.
+                    assert_eq!(move_ids(&t), [SpaceMoveId(1)]);
+                    t.reactor.handle_event(Event::ScratchpadMoveEnded(SpaceMoveId(0)));
+                    assert!(t.focus_requests().is_empty());
+                    assert_eq!(pending(&t).len(), 1);
+                }
+
+                #[test]
+                fn active_screen_without_a_recorded_space_shows_at_once() {
+                    let mut t = Test::two_screens_with(make_window(5));
+                    // Only the first screen's space is known.
+                    t.set_screen_spaces(vec![current(1)]);
+                    t.launch(4, vec![window_at(9, 1300.)], true);
+                    t.update_on_screen(not_on_screen);
+                    t.settle();
+                    t.reactor.handle_event(toggle("k", None));
+                    assert!(t.moves().is_empty());
+                    assert_eq!(t.focus_requests(), [pad()]);
+                }
+
+                #[test]
+                fn fullscreen_space_of_another_screen_does_not_stop_the_move() {
+                    let mut t = Test::two_screens_with(make_window(5));
+                    t.set_screen_spaces(vec![fullscreen(1), current(2)]);
+                    t.launch(4, vec![window_at(9, 1300.)], true);
+                    t.update_on_screen(not_on_screen);
+                    t.settle();
+                    t.reactor.handle_event(toggle("k", None));
+                    assert_eq!(
+                        t.moves().iter().map(|(_, space, _)| *space).collect::<Vec<_>>(),
+                        [SpaceId::new(2)]
+                    );
+                }
+
+                #[test]
+                fn replay_of_a_move_and_its_arrival_makes_the_same_decisions() {
+                    let mut t = pad_on_another_space();
+                    t.reactor.handle_event(toggle("k", None));
+                    t.update_on_screen(|_| true);
+                    assert_eq!(t.focus_requests(), [pad()]);
+                    let trace = replay::tests::recorded_trace(&mut t.reactor);
+                    let replayed = replay::tests::replay_trace(&trace);
+                    assert!(replayed.pending_space_moves.is_empty());
+                    assert_eq!(replayed.next_space_move_id, t.reactor.next_space_move_id);
+                    assert_eq!(
+                        replayed.windows[&pad()].frame_monotonic,
+                        t.reactor.windows[&pad()].frame_monotonic
+                    );
+                    assert_eq!(t.moves().len(), 1, "the replay did not move the window");
+                }
+
+                #[test]
+                fn replay_does_not_wait_where_the_live_reactor_did_not_move() {
+                    let mut t = pad_on_another_space();
+                    t.set_screen_spaces(vec![fullscreen(1)]);
+                    t.reactor.handle_event(toggle("k", None));
+                    assert!(t.moves().is_empty());
+                    let trace = replay::tests::recorded_trace(&mut t.reactor);
+                    let replayed = replay::tests::replay_trace(&trace);
+                    assert!(replayed.pending_space_moves.is_empty());
+                    assert_eq!(replayed.next_space_move_id, 0);
+                }
+            }
+        }
+
+        mod edge_cases {
+            use pretty_assertions::assert_eq;
+            use test_log::test;
+
+            use super::*;
+
+            const SCREEN2: CGRect = CGRect {
+                origin: CGPoint { x: 1000., y: 0. },
+                size: CGSize { width: 1000., height: 1000. },
+            };
+
+            pub(super) fn window_at(idx: usize, x: f64) -> WindowInfo {
+                let mut window = make_window(idx);
+                window.frame.origin.x = x;
+                window
+            }
+
+            impl Test {
+                /// Like [`Test::with_rules`], with the given screens and the
+                /// windows of the scratchpad app 2.
+                fn with_screens(
+                    rules: Vec<WindowRule>,
+                    frames: Vec<CGRect>,
+                    spaces: Vec<Option<SpaceId>>,
+                    pad_windows: Vec<WindowInfo>,
+                ) -> Test {
+                    let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+                    let scale_factors = vec![2.0; frames.len()];
+                    reactor.handle_event(Event::ScreenParametersChanged {
+                        frames,
+                        spaces,
+                        scale_factors,
+                        converter: CoordinateConverter::default(),
+                        on_screen: Default::default(),
+                    });
+                    reactor.handle_event(Event::ConfigChanged(config(rules)));
+                    let (raise_manager_tx, raise_rx) = mpsc::unbounded_channel();
+                    reactor.raise_manager_tx = raise_manager_tx;
+                    let system = FakeSystem::default();
+                    reactor.system = Box::new(system.clone());
+                    let mut test = Test {
+                        apps: Apps::new(),
+                        reactor,
+                        system,
+                        raise_rx,
+                        windows: vec![],
+                    };
+                    test.launch(1, make_windows(2), true);
+                    test.launch(2, pad_windows, false);
+                    test.reactor.handle_event(Event::StartupComplete);
+                    test.settle();
+                    test
+                }
+
+                pub(super) fn two_screens_with(pad_window: WindowInfo) -> Test {
+                    Self::two_screens(pad_window)
+                }
+
+                fn two_screens(pad_window: WindowInfo) -> Test {
+                    Self::with_screens(
+                        vec![
+                            rule("com.testapp2", "k", Some(FRAME)),
+                            rule("com.testapp3", "l", Some(FRAME)),
+                        ],
+                        vec![SCREEN, SCREEN2],
+                        vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+                        vec![pad_window],
+                    )
+                }
+
+                /// What the window server does after a config reload or a space
+                /// change: reports the spaces and asks every app for its windows.
+                pub(super) fn refresh(&mut self, spaces: Vec<Option<SpaceId>>) {
+                    let info = self
+                        .windows
+                        .iter()
+                        .filter_map(|(pid, w)| {
+                            Some(WindowServerInfo {
+                                pid: *pid,
+                                id: w.sys_id?,
+                                layer: 0,
+                                frame: w.frame,
+                            })
+                        })
+                        .collect();
+                    self.reactor
+                        .handle_event(Event::SpaceChanged(spaces, WindowsOnScreen::new(info)));
+                    self.apps.simulate_until_quiet(&mut self.reactor);
+                }
+
+                fn set_main_window(&mut self, wid: WindowId) {
+                    self.reactor.handle_event(Event::ApplicationMainWindowChanged(
+                        wid.pid,
+                        Some(wid),
+                        Quiet::No,
+                    ));
+                }
+
+                fn add_window(&mut self, wid: WindowId, window: WindowInfo) {
+                    self.windows.push((wid.pid, window.clone()));
+                    self.reactor.handle_event(Event::WindowCreated(wid, window, MouseState::Up));
+                    self.update_on_screen(|_| true);
+                    self.reactor.handle_event(Event::WindowBecameVisible(wid));
+                }
+            }
+
+            impl Test {
+                /// The user moves the window.
+                fn drag(&mut self, wid: WindowId, frame: CGRect) {
+                    let txid = self.reactor.windows[&wid].last_sent_txid;
+                    self.reactor.handle_event(Event::WindowFrameChanged(
+                        wid,
+                        frame,
+                        txid,
+                        Requested(false),
+                        Some(MouseState::Up),
+                    ));
+                    self.settle();
+                }
+            }
+
+            #[test]
+            fn toggle_uses_the_screen_of_the_focused_window() {
+                let mut t = Test::two_screens(make_window(5));
+                t.launch(4, vec![window_at(9, 1300.)], true);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [FRAME.to_frame(SCREEN2)]);
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn focused_window_parked_off_screen_is_shown() {
+                let mut t = Test::new();
+                let parked = CGRect::new(CGPoint::new(-5000., 100.), CGSize::new(50., 50.));
+                t.drag(pad(), parked);
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert!(!has_set_hidden(&requests, 2, true), "{requests:?}");
+            }
+
+            #[test]
+            fn window_moved_to_another_screen_is_registered_under_the_renamed_rule() {
+                let mut t = Test::two_screens(make_window(5));
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp2",
+                    "k2",
+                    Some(FRAME),
+                )])));
+                assert_eq!(t.reactor.layout.scratchpad_window("k2"), None);
+                t.drag(pad(), window_at(5, 1200.).frame);
+                assert_eq!(t.reactor.layout.scratchpad_window("k2"), Some(pad()));
+            }
+
+            #[test]
+            fn window_moved_from_a_disabled_space_stays_registered() {
+                let mut t = Test::with_screens(
+                    vec![rule("com.testapp3", "l", Some(FRAME))],
+                    vec![SCREEN, SCREEN2],
+                    vec![Some(SpaceId::new(1)), None],
+                    vec![],
+                );
+                t.launch(3, vec![window_at(7, 1200.)], false);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert!(t.reactor.layout.floating_windows_in_space(SpaceId::new(1)).is_empty());
+                t.drag(launched_pad(), make_window(7).frame);
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert_eq!(
+                    t.reactor.layout.floating_windows_in_space(SpaceId::new(1)),
+                    [launched_pad()].into_iter().collect()
+                );
+            }
+
+            #[test]
+            fn first_matching_rule_decides_the_scratchpad() {
+                let float = WindowRule {
+                    conditions: WindowRuleConditions {
+                        app_id: Some("com.testapp2".into()),
+                        ..Default::default()
+                    },
+                    float: Some(true),
+                    scratchpad: None,
+                    frame: None,
+                };
+                let t = Test::with_rules(vec![rule("com.testapp2", "k", Some(FRAME)), float]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(pad()));
+            }
+
+            #[test]
+            fn window_list_updated_while_hidden_does_not_stop_the_next_hide() {
+                let mut t = Test::new();
+                t.hide_pad();
+                t.focus_app(1);
+                // Another app changed the windows on screen while the
+                // scratchpad app was hidden.
+                t.update_on_screen(|wsid| wsid != WindowServerId::new(5));
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+
+                // The window server reports the window again once the app is
+                // shown.
+                t.reactor.handle_event(Event::ApplicationHiddenChanged(2, false));
+                t.update_on_screen(|_| true);
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(
+                    matches!(requests[..], [(2, Request::SetHidden(true))]),
+                    "{requests:?}"
+                );
+            }
+
+            #[test]
+            fn main_window_of_a_two_window_app_becomes_the_scratchpad() {
+                for main in [WindowId::new(3, 1), WindowId::new(3, 2)] {
+                    let mut t = Test::new();
+                    let windows = vec![make_window(7), make_window(8)];
+                    t.windows.extend(windows.iter().map(|w| (3, w.clone())));
+                    let events = t.apps.make_app_with_opts(3, windows, Some(main), false);
+                    t.reactor.handle_events(events);
+                    t.settle();
+                    assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(main));
+                }
+            }
+
+            #[test]
+            fn lowest_window_becomes_the_scratchpad_without_a_main_window() {
+                let mut t = Test::new();
+                let windows = vec![make_window(7), make_window(8), make_window(9)];
+                t.windows.extend(windows.iter().map(|w| (3, w.clone())));
+                let events = t.apps.make_app_with_opts(3, windows, None, false);
+                t.reactor.handle_events(events);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+            }
+
+            #[test]
+            fn show_queued_outside_send_layout_event_is_taken_on_screen_change() {
+                let mut t = Test::new();
+                t.launch(3, vec![], false);
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                let window = make_window(7);
+                t.reactor.windows.insert(launched_pad(), window.clone().into());
+                let info = t.reactor.layout_window_info(launched_pad()).unwrap();
+                _ = t.reactor.layout.handle_event(LayoutEvent::WindowAdded(
+                    SpaceId::new(1),
+                    launched_pad(),
+                    info,
+                ));
+                assert!(t.focus_requests().is_empty());
+
+                t.reactor.handle_event(Event::ScreenParametersChanged {
+                    frames: vec![SCREEN],
+                    spaces: vec![Some(SpaceId::new(1))],
+                    scale_factors: vec![2.0],
+                    converter: CoordinateConverter::default(),
+                    on_screen: Default::default(),
+                });
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            pub(super) fn frames_of(requests: &[(pid_t, Request)], wid: WindowId) -> Vec<CGRect> {
+                requests
+                    .iter()
+                    .filter_map(|(_, req)| match req {
+                        Request::SetWindowFrame(w, f, _) if *w == wid => Some(*f),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            #[test]
+            fn second_toggle_before_the_window_appears_shows_it_once() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert!(!t.launches().is_empty());
+                assert!(t.apps.tagged_requests().is_empty());
+                assert!(t.focus_requests().is_empty());
+
+                t.launch(3, vec![make_window(7)], false);
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+                let events = t.apps.simulate_events_for_tagged_requests(requests);
+                t.reactor.handle_events(events);
+
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                assert!(
+                    !t.focus_requests().contains(&launched_pad()),
+                    "the second toggle must not leave another pending show"
+                );
+            }
+
+            #[test]
+            fn launched_window_on_another_screen_is_placed_on_the_active_screen() {
+                let mut t = Test::two_screens(make_window(5));
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.launch(3, vec![window_at(7, 1200.)], false);
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn toggle_brings_a_window_from_another_screen_to_the_active_screen() {
+                let mut t = Test::two_screens(window_at(5, 1200.));
+                t.focus_app(1);
+                t.settle();
+                assert_eq!(
+                    t.reactor.layout.floating_windows_in_space(SpaceId::new(2)),
+                    [pad()].into_iter().collect()
+                );
+
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert!(!has_set_hidden(&requests, 2, true), "{requests:?}");
+                assert_eq!(t.focus_requests(), [pad()]);
+                let events = t.apps.simulate_events_for_tagged_requests(requests);
+                t.reactor.handle_events(events);
+
+                // Now it is on the active screen and focused: hide it.
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(
+                    matches!(requests[..], [(2, Request::SetHidden(true))]),
+                    "{requests:?}"
+                );
+            }
+
+            #[test]
+            fn focused_window_on_the_other_screen_is_hidden() {
+                // The active screen follows the focused window.
+                let mut t = Test::two_screens(window_at(5, 1200.));
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(
+                    matches!(requests[..], [(2, Request::SetHidden(true))]),
+                    "{requests:?}"
+                );
+            }
+
+            #[test]
+            fn launched_window_on_a_disabled_space_is_shown() {
+                let mut t = Test::with_screens(
+                    vec![rule("com.testapp3", "l", Some(FRAME))],
+                    vec![SCREEN, SCREEN2],
+                    vec![Some(SpaceId::new(1)), None],
+                    vec![],
+                );
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert_eq!(t.launches(), ["com.testapp3"]);
+                t.launch(3, vec![window_at(7, 1200.)], false);
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                let events = t.apps.simulate_events_for_tagged_requests(requests);
+                t.reactor.handle_events(events);
+
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert_eq!(t.launches(), ["com.testapp3"], "not launched again");
+            }
+
+            #[test]
+            fn window_created_later_on_a_disabled_space_is_registered() {
+                let mut t = Test::with_screens(
+                    vec![rule("com.testapp3", "l", Some(FRAME))],
+                    vec![SCREEN, SCREEN2],
+                    vec![Some(SpaceId::new(1)), None],
+                    vec![],
+                );
+                t.launch(3, vec![], false);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), None);
+                t.add_window(launched_pad(), window_at(7, 1200.));
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert!(t.reactor.layout.floating_windows_in_space(SpaceId::new(1)).is_empty());
+
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert!(t.launches().is_empty());
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn window_on_a_disabled_space_is_registered_and_shown_without_a_launch() {
+                let mut t = Test::new();
+                t.refresh(vec![None]);
+                t.launch(3, vec![make_window(7)], false);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+
+                t.focus_app(1);
+                t.settle();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert!(t.launches().is_empty());
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+                assert!(
+                    !requests.iter().any(|(pid, _)| *pid == 1),
+                    "windows on the disabled space are left alone: {requests:?}"
+                );
+            }
+
+            #[test]
+            fn window_that_is_not_on_screen_is_registered() {
+                let mut t = Test::new();
+                // The app's window is on another space, but known from an
+                // earlier launch event.
+                let window = make_window(7);
+                t.windows.push((3, window.clone()));
+                let events = t.apps.make_app_with_opts(3, vec![window], None, false);
+                t.reactor.handle_events(events);
+                t.update_on_screen(|wsid| wsid != WindowServerId::new(7));
+                t.reactor.handle_event(Event::WindowsDiscovered {
+                    pid: 3,
+                    new: vec![],
+                    known_visible: vec![],
+                });
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                assert!(t.launches().is_empty());
+            }
+
+            #[test]
+            fn tiled_window_on_a_disabled_space_does_not_become_a_scratchpad() {
+                let mut t = Test::new();
+                // App 1 is tiled, then a rule makes it a scratchpad while its
+                // space is disabled.
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp1",
+                    "t",
+                    None,
+                )])));
+                t.refresh(vec![None]);
+                assert_eq!(t.reactor.layout.scratchpad_window("t"), None);
+            }
+
+            #[test]
+            fn visible_window_is_preferred_over_a_window_on_another_space() {
+                let mut t = Test::new();
+                let windows = vec![make_window(7), make_window(8)];
+                t.windows.extend(windows.iter().map(|w| (3, w.clone())));
+                let events = t.apps.make_app_with_opts(3, windows, None, false);
+                t.reactor.handle_events(events);
+                t.update_on_screen(|wsid| wsid != WindowServerId::new(7));
+                t.reactor.handle_event(Event::WindowDestroyed(launched_pad()));
+                t.reactor.handle_event(Event::WindowsDiscovered {
+                    pid: 3,
+                    new: vec![(launched_pad(), make_window(7))],
+                    known_visible: vec![],
+                });
+                assert_eq!(
+                    t.reactor.layout.scratchpad_window("l"),
+                    Some(WindowId::new(3, 2))
+                );
+            }
+
+            #[test]
+            fn main_window_on_another_screen_becomes_the_scratchpad() {
+                let mut t = Test::two_screens(make_window(5));
+                let main = WindowId::new(3, 2);
+                let windows = vec![make_window(7), window_at(8, 1200.)];
+                t.windows.extend(windows.iter().map(|w| (3, w.clone())));
+                let events = t.apps.make_app_with_opts(3, windows, Some(main), false);
+                t.reactor.handle_events(events);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(main));
+                assert_eq!(
+                    t.reactor.layout.floating_windows_in_space(SpaceId::new(2)),
+                    [main].into_iter().collect()
+                );
+            }
+
+            #[test]
+            fn registered_scratchpad_is_shown_while_the_space_is_disabled() {
+                let mut t = Test::new();
+                t.refresh(vec![None]);
+                t.focus_app(1);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(pad()));
+
+                t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+                assert!(t.launches().is_empty());
+                assert!(
+                    !requests.iter().any(|(pid, _)| *pid == 1),
+                    "windows on the disabled space are left alone: {requests:?}"
+                );
+            }
+
+            #[test]
+            fn only_the_scratchpad_window_of_a_two_window_app_is_shown() {
+                let mut t = Test::with_screens(
+                    vec![rule("com.testapp2", "k", Some(FRAME))],
+                    vec![SCREEN],
+                    vec![Some(SpaceId::new(1))],
+                    vec![make_window(5), make_window(6)],
+                );
+                assert_eq!(
+                    t.reactor.layout.floating_windows_in_space(SpaceId::new(1)),
+                    [WindowId::new(2, 1), WindowId::new(2, 2)].into_iter().collect(),
+                    "both windows match the rule and float"
+                );
+                // Either window can be the scratchpad; the other one is not.
+                let pad = t.reactor.layout.scratchpad_window("k").unwrap();
+                let other = [WindowId::new(2, 1), WindowId::new(2, 2)]
+                    .into_iter()
+                    .find(|&w| w != pad)
+                    .unwrap();
+                assert_eq!(t.reactor.layout.scratchpad_frame(other), None);
+
+                // The other window of the scratchpad app is focused.
+                t.focus_app(2);
+                t.set_main_window(other);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad), [SHOWN]);
+                assert!(frames_of(&requests, other).is_empty(), "{requests:?}");
+                assert!(
+                    !requests.iter().any(|(_, r)| matches!(r, Request::SetHidden(_))),
+                    "{requests:?}"
+                );
+                assert_eq!(t.focus_requests(), [pad]);
+                let events = t.apps.simulate_events_for_tagged_requests(requests);
+                t.reactor.handle_events(events);
+
+                t.set_main_window(pad);
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(
+                    matches!(requests[..], [(2, Request::SetHidden(true))]),
+                    "{requests:?}"
+                );
+            }
+
+            #[test]
+            fn remaining_window_of_the_app_takes_over_after_the_next_refresh() {
+                let mut t = Test::with_screens(
+                    vec![rule("com.testapp2", "k", Some(FRAME))],
+                    vec![SCREEN],
+                    vec![Some(SpaceId::new(1))],
+                    vec![make_window(5), make_window(6)],
+                );
+                let pad = t.reactor.layout.scratchpad_window("k").unwrap();
+                let second = [WindowId::new(2, 1), WindowId::new(2, 2)]
+                    .into_iter()
+                    .find(|&w| w != pad)
+                    .unwrap();
+                let pad_wsid = t.reactor.windows[&pad].window_server_id;
+                t.reactor.handle_event(Event::WindowDestroyed(pad));
+                t.apps.windows.remove(&pad);
+                t.windows.retain(|(_, w)| w.sys_id != pad_wsid);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(second));
+                t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                assert!(t.launches().is_empty());
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, second), [SHOWN]);
+            }
+
+            #[test]
+            fn window_closed_while_hidden_is_replaced_by_a_launched_one() {
+                let mut t = Test::new();
+                t.hide_pad();
+                t.focus_app(1);
+                t.reactor.handle_event(Event::WindowDestroyed(pad()));
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+                assert!(t.reactor.is_app_hidden(2));
+
+                t.reactor.handle_event(toggle("k", Some("com.testapp2")));
+                assert_eq!(t.launches(), ["com.testapp2"]);
+                assert!(t.apps.tagged_requests().is_empty());
+
+                let new_pad = WindowId::new(2, 2);
+                t.add_window(new_pad, make_window(8));
+                let requests = t.apps.tagged_requests();
+                assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+                assert_eq!(frames_of(&requests, new_pad), [SHOWN]);
+                assert_eq!(t.focus_requests(), [new_pad]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(new_pad));
+            }
+
+            #[test]
+            fn window_closed_while_hidden_is_not_shown_by_the_next_window_without_toggle() {
+                let mut t = Test::new();
+                t.hide_pad();
+                t.reactor.handle_event(Event::WindowDestroyed(pad()));
+                t.settle();
+                t.add_window(WindowId::new(2, 2), make_window(8));
+                let requests = t.apps.tagged_requests();
+                assert!(!has_set_hidden(&requests, 2, false), "{requests:?}");
+                assert!(t.focus_requests().is_empty());
+                assert_eq!(
+                    t.reactor.layout.scratchpad_window("k"),
+                    Some(WindowId::new(2, 2))
+                );
+            }
+
+            #[test]
+            fn renamed_rule_moves_the_window_to_the_new_name_after_reload() {
+                let mut t = Test::new();
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp2",
+                    "k2",
+                    Some(FRAME),
+                )])));
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k2"), Some(pad()));
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+                assert!(t.focus_requests().is_empty(), "reload shows nothing");
+
+                t.reactor.handle_event(toggle("k2", Some("com.testapp2")));
+                assert!(t.launches().is_empty());
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn changed_frame_is_used_after_reload() {
+                let mut t = Test::new();
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp2",
+                    "k",
+                    None,
+                )])));
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(
+                    frames_of(&requests, pad()),
+                    [FractionalRect::DEFAULT.to_frame(SCREEN)]
+                );
+            }
+
+            #[test]
+            fn removed_rule_stops_the_window_being_a_scratchpad_after_reload() {
+                let mut t = Test::new();
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![])));
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+
+                // The window can now be tiled like any other floating window.
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(Event::Command(Command::Layout(
+                    LayoutCommand::ToggleWindowFloating,
+                )));
+                t.settle();
+                assert!(t.reactor.layout.floating_windows_in_space(SpaceId::new(1)).is_empty());
+            }
+
+            #[test]
+            fn hiding_another_app_does_not_change_the_scratchpad_decision() {
+                let mut t = Test::new();
+                t.focus_app(2);
+                t.reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(
+                    matches!(requests[..], [(2, Request::SetHidden(true))]),
+                    "{requests:?}"
+                );
+                let events = t.apps.simulate_events_for_tagged_requests(requests);
+                t.reactor.handle_events(events);
+                assert!(t.reactor.is_app_hidden(1));
+                assert!(t.reactor.is_app_hidden(2));
+
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+                assert!(
+                    !requests.iter().any(|(pid, _)| *pid == 1),
+                    "the other hidden app stays hidden: {requests:?}"
+                );
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn move_focus_does_nothing_from_a_visible_scratchpad() {
+                let mut t = Test::new();
+                t.focus_app(2);
+                t.settle();
+                for direction in [Direction::Left, Direction::Right] {
+                    t.reactor.handle_event(Event::Command(Command::Layout(
+                        LayoutCommand::MoveFocus(direction),
+                    )));
+                }
+                assert!(t.focus_requests().is_empty());
+                assert!(t.apps.tagged_requests().is_empty());
+            }
+
+            #[test]
+            fn toggle_focus_floating_leaves_a_visible_scratchpad_for_the_tiled_windows() {
+                let mut t = Test::new();
+                t.focus_app(2);
+                t.settle();
+                t.reactor.handle_event(Event::Command(Command::Layout(
+                    LayoutCommand::ToggleFocusFloating,
+                )));
+                let focus = t.focus_requests();
+                assert_eq!(focus.len(), 1, "{focus:?}");
+                assert_eq!(focus[0].pid, 1, "{focus:?}");
+                assert!(t.apps.tagged_requests().is_empty());
+
+                // Back from the tiled window: the scratchpad is not the
+                // floating window to return to.
+                t.focus_app(1);
+                t.settle();
+                t.reactor.handle_event(Event::Command(Command::Layout(
+                    LayoutCommand::ToggleFocusFloating,
+                )));
+                assert!(t.focus_requests().is_empty());
+            }
+
+            fn titled_rule(app_id: &str, title: &str, name: &str) -> WindowRule {
+                let mut rule = rule(app_id, name, Some(FRAME));
+                rule.conditions.title_substring = Some(title.into());
+                rule
+            }
+
+            #[test]
+            fn rule_moved_to_another_app_releases_the_old_window() {
+                let mut t = Test::new();
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp3",
+                    "k",
+                    Some(FRAME),
+                )])));
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), None);
+
+                t.launch(3, vec![make_window(7)], false);
+                t.settle();
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(launched_pad()));
+            }
+
+            #[test]
+            fn every_scratchpad_found_by_one_launch_is_shown_at_once() {
+                let mut t = Test::with_rules(vec![
+                    titled_rule("com.testapp3", "Window7", "l"),
+                    titled_rule("com.testapp3", "Window8", "m"),
+                ]);
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(toggle("m", Some("com.testapp3")));
+                let second = WindowId::new(3, 2);
+
+                let windows = vec![make_window(7), make_window(8)];
+                t.windows.extend(windows.iter().map(|w| (3, w.clone())));
+                let events = t.apps.make_app_with_opts(3, windows, None, false);
+                t.reactor.handle_events(events);
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert_eq!(t.reactor.layout.scratchpad_window("m"), Some(second));
+                let requests = t.apps.tagged_requests();
+                assert_eq!(frames_of(&requests, launched_pad()), [SHOWN]);
+                assert_eq!(frames_of(&requests, second), [SHOWN]);
+                assert_eq!(t.focus_requests(), [launched_pad(), second]);
+            }
+
+            #[test]
+            fn expiry_of_an_unknown_show_changes_nothing() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                let id = t.last_launch_id();
+                t.reactor.handle_event(toggle("k", None));
+                t.settle();
+                t.reactor.handle_event(Event::ScratchpadShowExpired(id));
+                t.reactor.handle_event(Event::ScratchpadShowExpired(id));
+                assert!(t.apps.tagged_requests().is_empty());
+                assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), None);
+                assert_eq!(t.reactor.layout.scratchpad_window("k"), Some(pad()));
+            }
+
+            #[test]
+            fn toggle_after_an_expired_show_launches_and_shows_again() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                let first = t.last_launch_id();
+                t.reactor.handle_event(Event::ScratchpadShowExpired(first));
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                let second = t.last_launch_id();
+                assert_ne!(first, second);
+                assert_eq!(t.launches(), ["com.testapp3", "com.testapp3"]);
+                assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), Some(second));
+
+                t.launch(3, vec![make_window(7)], false);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn quitting_another_app_keeps_the_pending_show() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(Event::ApplicationTerminated(2));
+                t.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+                t.settle();
+                assert!(t.reactor.layout.pending_scratchpad_show("l").is_some());
+
+                t.launch(3, vec![make_window(7)], false);
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn app_quitting_before_its_window_appears_is_not_shown_on_relaunch() {
+                let mut t = Test::new();
+                t.launch(3, vec![], false);
+                t.settle();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(Event::ApplicationTerminated(3));
+                t.reactor.handle_event(Event::ApplicationThreadTerminated(3));
+                t.settle();
+
+                // The app is opened again by other means.
+                t.launch(3, vec![make_window(7)], false);
+                assert_eq!(t.reactor.layout.scratchpad_window("l"), Some(launched_pad()));
+                assert!(t.focus_requests().is_empty());
+                assert!(!has_frame(&t.apps.tagged_requests(), launched_pad(), SHOWN));
+            }
+
+            #[test]
+            fn pending_show_survives_a_reload_that_keeps_the_rule() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp3",
+                    "l",
+                    None,
+                )])));
+                t.refresh(vec![Some(SpaceId::new(1))]);
+                t.launch(3, vec![make_window(7)], false);
+                let requests = t.apps.tagged_requests();
+                assert_eq!(
+                    frames_of(&requests, launched_pad()),
+                    [FractionalRect::DEFAULT.to_frame(SCREEN)]
+                );
+                assert_eq!(t.focus_requests(), [launched_pad()]);
+            }
+
+            #[test]
+            fn pending_show_of_a_renamed_rule_is_dropped() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(Event::ConfigChanged(config(vec![rule(
+                    "com.testapp3",
+                    "l2",
+                    Some(FRAME),
+                )])));
+                assert_eq!(t.reactor.layout.pending_scratchpad_show("l"), None);
+                t.launch(3, vec![make_window(7)], false);
+                assert_eq!(t.reactor.layout.scratchpad_window("l2"), Some(launched_pad()));
+                assert!(t.focus_requests().is_empty());
+                assert!(!has_frame(&t.apps.tagged_requests(), launched_pad(), SHOWN));
+            }
+
+            #[test]
+            fn app_hidden_by_the_system_updates_the_next_toggle() {
+                let mut t = Test::new();
+                t.focus_app(2);
+                t.settle();
+                // Cmd+H on the scratchpad app: the app actor reports the
+                // change, then the window server drops the window.
+                t.reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+                t.update_on_screen(|wsid| wsid != WindowServerId::new(5));
+                t.focus_app(1);
+                t.settle();
+                t.reactor.handle_event(toggle("k", None));
+                let requests = t.apps.tagged_requests();
+                assert!(has_set_hidden(&requests, 2, false), "{requests:?}");
+                assert_eq!(frames_of(&requests, pad()), [SHOWN]);
+                assert_eq!(t.focus_requests(), [pad()]);
+            }
+
+            #[test]
+            fn launch_ids_are_the_same_on_replay() {
+                let mut t = Test::new();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                let first = t.last_launch_id();
+                t.reactor.handle_event(toggle("l", Some("com.testapp3")));
+                t.reactor.handle_event(toggle("m", Some("com.testapp4")));
+                t.reactor.handle_event(Event::ScratchpadShowExpired(first));
+                let trace = replay::tests::recorded_trace(&mut t.reactor);
+                let replayed = replay::tests::replay_trace(&trace);
+                assert_eq!(
+                    replayed.layout.pending_scratchpad_show("l"),
+                    t.reactor.layout.pending_scratchpad_show("l")
+                );
+                assert_eq!(
+                    replayed.layout.pending_scratchpad_show("m"),
+                    t.reactor.layout.pending_scratchpad_show("m")
+                );
+                assert!(replayed.layout.pending_scratchpad_show("l").is_some());
+            }
+        }
+    }
+
+    fn reactor_with_one_screen() -> Reactor {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor
+    }
+
+    #[test]
+    fn app_hidden_state_follows_hidden_changed_events() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        assert!(!reactor.is_app_hidden(1));
+
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        assert!(reactor.is_app_hidden(1));
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, false));
+        assert!(!reactor.is_app_hidden(1));
+
+        assert!(!reactor.is_app_hidden(2));
+        reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+        assert!(!reactor.is_app_hidden(2), "unknown apps are not tracked");
+        assert!(apps.requests().is_empty());
+    }
+
+    #[test]
+    fn app_hidden_state_starts_from_launch_info() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        let mut events = apps.make_app(1, make_windows(1));
+        for event in &mut events {
+            if let Event::ApplicationLaunched { info, .. } = event {
+                info.is_hidden = true;
+            }
+        }
+        reactor.handle_events(events);
+        reactor.handle_events(apps.make_app(2, make_windows(0)));
+        assert!(reactor.is_app_hidden(1));
+        assert!(!reactor.is_app_hidden(2));
+
+        reactor.handle_event(Event::ApplicationThreadTerminated(1));
+        assert!(!reactor.is_app_hidden(1));
+    }
+
+    #[test]
+    fn harness_answers_set_hidden_with_hidden_changed() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_events(apps.make_app(2, make_windows(0)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.apps[&2].handle.send(Request::SetHidden(true)).unwrap();
+        let requests = apps.tagged_requests();
+        assert!(
+            matches!(requests[..], [(2, Request::SetHidden(true))]),
+            "{requests:?}"
+        );
+        let events = apps.simulate_events_for_tagged_requests(requests);
+        assert!(matches!(events[..], [Event::ApplicationHiddenChanged(2, true)]));
+        reactor.handle_events(events);
+        assert_eq!(apps.hidden.get(&2), Some(&true));
+        assert!(reactor.is_app_hidden(2));
+        assert!(!reactor.is_app_hidden(1));
+
+        reactor.apps[&2].handle.send(Request::SetHidden(false)).unwrap();
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(apps.hidden.get(&2), Some(&false));
+        assert!(!reactor.is_app_hidden(2));
+    }
+
+    #[test]
+    fn app_info_without_hidden_field_deserializes_as_shown() {
+        let info: AppInfo =
+            ron::de::from_str(r#"(bundle_id: Some("com.example"), localized_name: None)"#).unwrap();
+        assert!(!info.is_hidden);
+        let event = Event::ApplicationHiddenChanged(3, true);
+        let line = ron::ser::to_string(&event).unwrap();
+        let back: Event = ron::de::from_str(&line).unwrap();
+        assert!(matches!(back, Event::ApplicationHiddenChanged(3, true)));
+    }
+
+    fn launch_events(apps: &mut Apps, pid: pid_t, windows: usize, hidden: bool) -> Vec<Event> {
+        let mut events = apps.make_app(pid, make_windows(windows));
+        for event in &mut events {
+            if let Event::ApplicationLaunched { info, .. } = event {
+                info.is_hidden = hidden;
+            }
+        }
+        events
+    }
+
+    fn window_frames(reactor: &Reactor) -> Vec<(WindowId, CGRect)> {
+        reactor
+            .windows
+            .iter()
+            .map(|(&wid, w)| (wid, w.frame_monotonic))
+            .sorted_by_key(|(wid, _)| *wid)
+            .collect()
+    }
+
+    #[test]
+    fn repeated_hidden_changed_events_keep_the_last_state() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        let frames = window_frames(&reactor);
+
+        for _ in 0..2 {
+            reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+            assert!(reactor.is_app_hidden(1));
+        }
+        for _ in 0..2 {
+            reactor.handle_event(Event::ApplicationHiddenChanged(1, false));
+            assert!(!reactor.is_app_hidden(1));
+        }
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        assert!(reactor.is_app_hidden(1));
+
+        let requests = apps.tagged_requests();
+        assert!(
+            requests.is_empty(),
+            "hide/show must not produce requests: {requests:?}"
+        );
+        assert_eq!(
+            window_frames(&reactor),
+            frames,
+            "hide/show must not change the layout"
+        );
+    }
+
+    #[test]
+    fn hidden_state_is_tracked_per_app() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(launch_events(&mut apps, 1, 1, false));
+        reactor.handle_events(launch_events(&mut apps, 2, 1, true));
+        reactor.handle_events(launch_events(&mut apps, 3, 0, false));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(
+            [1, 2, 3].map(|pid| reactor.is_app_hidden(pid)),
+            [false, true, false]
+        );
+
+        reactor.handle_event(Event::ApplicationHiddenChanged(3, true));
+        reactor.handle_event(Event::ApplicationHiddenChanged(2, false));
+        assert_eq!(
+            [1, 2, 3].map(|pid| reactor.is_app_hidden(pid)),
+            [false, false, true]
+        );
+    }
+
+    #[test]
+    fn hidden_state_survives_application_terminated_until_thread_exits() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+
+        reactor.handle_event(Event::ApplicationTerminated(1));
+        assert!(reactor.is_app_hidden(1));
+        let requests = apps.tagged_requests();
+        assert!(matches!(requests[..], [(1, Request::Terminate)]), "{requests:?}");
+
+        reactor.handle_event(Event::ApplicationThreadTerminated(1));
+        assert!(!reactor.is_app_hidden(1));
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        assert!(
+            !reactor.is_app_hidden(1),
+            "a late event for a terminated app must not resurrect its state"
+        );
+    }
+
+    #[test]
+    fn relaunched_app_with_same_pid_starts_from_new_launch_info() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(launch_events(&mut apps, 1, 1, false));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        reactor.handle_event(Event::ApplicationThreadTerminated(1));
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.handle_events(launch_events(&mut apps, 1, 1, false));
+        apps.simulate_until_quiet(&mut reactor);
+        assert!(!reactor.is_app_hidden(1));
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        assert!(reactor.is_app_hidden(1));
+
+        reactor.handle_event(Event::ApplicationThreadTerminated(1));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_events(launch_events(&mut apps, 1, 1, true));
+        apps.simulate_until_quiet(&mut reactor);
+        assert!(reactor.is_app_hidden(1));
+    }
+
+    #[test]
+    fn relaunched_app_with_new_pid_is_independent_of_old_pid() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(launch_events(&mut apps, 1, 1, false));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        reactor.handle_event(Event::ApplicationThreadTerminated(1));
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.handle_events(launch_events(&mut apps, 5, 1, false));
+        apps.simulate_until_quiet(&mut reactor);
+        assert!(!reactor.is_app_hidden(5));
+        assert!(!reactor.is_app_hidden(1));
+
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, true));
+        assert!(!reactor.is_app_hidden(5));
+        assert!(!reactor.is_app_hidden(1));
+        reactor.handle_event(Event::ApplicationHiddenChanged(5, true));
+        assert!(reactor.is_app_hidden(5));
+    }
+
+    #[test]
+    fn harness_attributes_set_hidden_to_the_app_it_was_sent_to() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        for pid in [1, 2, 3] {
+            reactor.handle_events(apps.make_app(pid, make_windows(1)));
+        }
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.apps[&3].handle.send(Request::SetHidden(true)).unwrap();
+        reactor.apps[&1].handle.send(Request::SetHidden(true)).unwrap();
+        reactor.apps[&3].handle.send(Request::SetHidden(false)).unwrap();
+        let requests = apps.tagged_requests();
+        assert!(
+            matches!(
+                requests[..],
+                [
+                    (1, Request::SetHidden(true)),
+                    (3, Request::SetHidden(true)),
+                    (3, Request::SetHidden(false)),
+                ]
+            ),
+            "{requests:?}"
+        );
+        let events = apps.simulate_events_for_tagged_requests(requests);
+        assert!(
+            matches!(
+                events[..],
+                [
+                    Event::ApplicationHiddenChanged(1, true),
+                    Event::ApplicationHiddenChanged(3, true),
+                    Event::ApplicationHiddenChanged(3, false),
+                ]
+            ),
+            "{events:?}"
+        );
+        reactor.handle_events(events);
+        assert_eq!(apps.hidden, BTreeMap::from([(1, true), (3, false)]));
+        assert_eq!(
+            [1, 2, 3].map(|pid| reactor.is_app_hidden(pid)),
+            [true, false, false]
+        );
+    }
+
+    #[test]
+    fn harness_simulate_events_answers_set_hidden() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_events(apps.make_app(2, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.apps[&2].handle.send(Request::SetHidden(true)).unwrap();
+        let events = apps.simulate_events();
+        assert!(
+            matches!(events[..], [Event::ApplicationHiddenChanged(2, true)]),
+            "{events:?}"
+        );
+        assert!(apps.simulate_events().is_empty(), "requests are consumed once");
+    }
+
+    #[test]
+    fn harness_untagged_requests_still_see_every_app() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_events(apps.make_app(2, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.apps[&2].handle.send(Request::SetHidden(false)).unwrap();
+        reactor.apps[&1].handle.send(Request::GetVisibleWindows).unwrap();
+        let requests = apps.requests();
+        assert!(
+            matches!(
+                requests[..],
+                [Request::GetVisibleWindows, Request::SetHidden(false)]
+            ),
+            "{requests:?}"
+        );
+        assert!(apps.requests().is_empty());
+    }
+
+    #[test]
+    fn harness_terminate_only_drops_requests_of_the_terminated_app() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_events(apps.make_app(2, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        reactor.apps[&1].handle.send(Request::Terminate).unwrap();
+        reactor.apps[&1].handle.send(Request::SetHidden(true)).unwrap();
+        reactor.apps[&2].handle.send(Request::SetHidden(true)).unwrap();
+        let events = apps.simulate_events();
+        assert!(
+            matches!(events[..], [Event::ApplicationHiddenChanged(2, true)]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SetHidden needs the app pid")]
+    fn harness_untagged_simulation_rejects_set_hidden() {
+        let mut apps = Apps::new();
+        apps.simulate_events_for_requests(vec![Request::SetHidden(true)]);
+    }
+
+    #[test]
+    fn hidden_changed_event_is_recorded_and_replayed() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(launch_events(&mut apps, 1, 1, true));
+        reactor.handle_events(apps.make_app(2, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ApplicationHiddenChanged(2, true));
+        reactor.handle_event(Event::ApplicationHiddenChanged(1, false));
+
+        let trace = replay::tests::recorded_trace(&mut reactor);
+        assert!(trace.contains("ApplicationHiddenChanged(2,true)"), "{trace}");
+        assert!(trace.contains("is_hidden:true"), "{trace}");
+        let replayed = replay::tests::replay_trace(&trace);
+        assert_eq!([1, 2].map(|pid| replayed.is_app_hidden(pid)), [false, true]);
+    }
+
+    #[test]
+    fn old_trace_without_hidden_field_replays_as_shown() {
+        let mut apps = Apps::new();
+        let mut reactor = reactor_with_one_screen();
+        reactor.handle_events(launch_events(&mut apps, 1, 1, true));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let trace = replay::tests::recorded_trace(&mut reactor);
+        let old_trace = trace.replace(",is_hidden:true", "");
+        assert_ne!(old_trace, trace, "the launch info must carry is_hidden: {trace}");
+        assert!(!old_trace.contains("is_hidden"));
+        let replayed = replay::tests::replay_trace(&old_trace);
+        assert!(replayed.apps.contains_key(&1));
+        assert!(!replayed.is_app_hidden(1));
+        let replayed = replay::tests::replay_trace(&trace);
+        assert!(replayed.is_app_hidden(1));
     }
 
     #[test]

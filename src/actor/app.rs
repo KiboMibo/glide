@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use accessibility::{AXError, AXUIElement, AXUIElementActions, AXUIElementAttributes};
 use accessibility_sys::{
     kAXApplicationActivatedNotification, kAXApplicationDeactivatedNotification,
+    kAXApplicationHiddenNotification, kAXApplicationShownNotification,
     kAXMainWindowChangedNotification, kAXStandardWindowSubrole, kAXTitleChangedNotification,
     kAXUIElementDestroyedNotification, kAXWindowCreatedNotification,
     kAXWindowDeminiaturizedNotification, kAXWindowMiniaturizedNotification,
@@ -163,6 +164,13 @@ pub enum Request {
     /// Sent by WindowServer actor when a window is destroyed.
     /// See [`actor::window_server::Event::RegisterWindow`].
     WindowDestroyed(WindowId),
+
+    /// Hide or unhide the application. The resulting state change is reported
+    /// with [`Event::ApplicationHiddenChanged`].
+    SetHidden(bool),
+
+    /// Unminimize the window if it is minimized.
+    Unminimize(WindowId),
 }
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
@@ -241,6 +249,13 @@ const APP_NOTIFICATIONS: &[&str] = &[
     kAXApplicationDeactivatedNotification,
     kAXMainWindowChangedNotification,
     kAXWindowCreatedNotification,
+];
+
+/// Registered once after [`APP_NOTIFICATIONS`]; failing to register these does
+/// not stop the app from being managed.
+const OPTIONAL_APP_NOTIFICATIONS: &[&str] = &[
+    kAXApplicationHiddenNotification,
+    kAXApplicationShownNotification,
 ];
 
 const WINDOW_NOTIFICATIONS: &[&str] = &[
@@ -415,7 +430,7 @@ impl State {
     fn init(
         &mut self,
         handle: AppThreadHandle,
-        info: AppInfo,
+        mut info: AppInfo,
         _startup: Option<wm_controller::StartupToken>,
     ) -> bool {
         static IGNORE_APPS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
@@ -464,6 +479,8 @@ impl State {
         }
         self.main_window = self.app.main_window().ok().and_then(|w| self.id(&w).ok());
         self.is_frontmost = self.app.frontmost().map(|b| b.value()).unwrap_or(false);
+        // Read after registering for hide/show notifications so no change is missed.
+        info.is_hidden = crate::sys::app::is_app_hidden(self.pid).unwrap_or(info.is_hidden);
 
         let pid = self.pid;
         if self
@@ -534,6 +551,12 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        for notif in OPTIONAL_APP_NOTIFICATIONS {
+            match self.observer.add_notification(&self.app, notif) {
+                Ok(()) | Err(accessibility::Error::Ax(AXError::NotificationAlreadyRegistered)) => {}
+                Err(err) => debug!(pid = ?self.pid, ?err, "Watching app for {notif} failed"),
             }
         }
         true
@@ -711,6 +734,17 @@ impl State {
             &mut Request::WindowDestroyed(wid) => {
                 self.on_window_destroyed(wid);
             }
+            &mut Request::SetHidden(hidden) => {
+                if !crate::sys::app::set_app_hidden(self.pid, hidden) {
+                    warn!(?self.bundle_id, ?self.pid, hidden, "Failed to set app hidden state");
+                }
+            }
+            &mut Request::Unminimize(wid) => {
+                let elem = self.window_mut(wid)?.elem.clone();
+                if trace("minimized", &elem, || elem.minimized())?.value() {
+                    trace("set_minimized", &elem, || elem.set_minimized(false))?;
+                }
+            }
         }
         Ok(false)
     }
@@ -723,6 +757,10 @@ impl State {
         match notif {
             kAXApplicationActivatedNotification | kAXApplicationDeactivatedNotification => {
                 _ = self.on_activation_changed();
+            }
+            kAXApplicationHiddenNotification | kAXApplicationShownNotification => {
+                let hidden = notif == kAXApplicationHiddenNotification;
+                self.send_event(Event::ApplicationHiddenChanged(self.pid, hidden));
             }
             kAXMainWindowChangedNotification => {
                 // A raise we started may be waiting on the activation event

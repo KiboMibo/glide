@@ -21,11 +21,39 @@ use tracing::{debug, warn};
 #[repr(transparent)]
 pub struct SpaceId(NonZeroU64);
 
+impl SpaceId {
+    /// The space with the raw id SkyLight uses, or None for 0.
+    pub fn from_raw(id: u64) -> Option<SpaceId> {
+        NonZeroU64::new(id).map(SpaceId)
+    }
+
+    /// The raw id SkyLight uses for the space.
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 #[cfg(test)]
 impl SpaceId {
     pub fn new(id: u64) -> SpaceId {
         SpaceId(NonZeroU64::new(id).unwrap())
     }
+}
+
+/// The space a screen currently shows.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSpace {
+    pub id: SpaceId,
+    /// Whether the space holds a fullscreen window.
+    pub fullscreen: bool,
+}
+
+/// Whether the space holds a fullscreen window. False if the space does not
+/// exist.
+pub fn space_is_fullscreen(space: SpaceId) -> bool {
+    const FULLSCREEN_SPACE: c_int = 4;
+    // SAFETY: The call takes plain values and returns an int.
+    unsafe { SLSSpaceGetType(CGSMainConnectionID(), space.get()) == FULLSCREEN_SPACE }
 }
 
 /// Calculates the screen and space configuration.
@@ -125,7 +153,20 @@ impl<S: System> ScreenCache<S> {
             .map(|screen| unsafe {
                 CGSManagedDisplayGetCurrentSpace(CGSMainConnectionID(), screen)
             })
-            .map(|id| Some(SpaceId(NonZeroU64::new(id)?)))
+            .map(SpaceId::from_raw)
+            .collect()
+    }
+
+    /// Like [`Self::get_screen_spaces`], with the type of each space.
+    pub fn get_current_spaces(&self) -> Vec<Option<ScreenSpace>> {
+        self.get_screen_spaces()
+            .into_iter()
+            .map(|space| {
+                space.map(|id| ScreenSpace {
+                    id,
+                    fullscreen: space_is_fullscreen(id),
+                })
+            })
             .collect()
     }
 }
@@ -357,6 +398,11 @@ unsafe extern "C" {
     fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> Option<NonNull<CFString>>;
 }
 
+#[link(name = "SkyLight", kind = "framework")]
+unsafe extern "C" {
+    fn SLSSpaceGetType(cid: c_int, sid: u64) -> c_int;
+}
+
 bitflags! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     #[repr(transparent)]
@@ -387,7 +433,10 @@ bitflags! {
 mod test {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 
-    use super::{CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System};
+    use super::{
+        CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, SpaceId, System, diagnostic,
+        space_is_fullscreen,
+    };
 
     struct Stub {
         cg_screens: Vec<CGScreenInfo>,
@@ -442,6 +491,14 @@ mod test {
                 .map(|s| s.visible_frame)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn space_type_can_be_read() {
+        // Only checks that the call links and does not crash; the type of the
+        // current space depends on the machine.
+        _ = space_is_fullscreen(diagnostic::cur_space());
+        assert!(!space_is_fullscreen(SpaceId::new(u64::MAX)));
     }
 
     #[test]

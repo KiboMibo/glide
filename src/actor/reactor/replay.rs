@@ -116,3 +116,41 @@ pub fn replay(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::io::{Read, Seek};
+
+    use super::*;
+
+    /// The trace a test reactor has recorded so far.
+    pub(in crate::actor::reactor) fn recorded_trace(reactor: &mut Reactor) -> String {
+        let temp = reactor.record.temp().expect("test reactor records to a temp file");
+        temp.as_file().flush().unwrap();
+        let mut file = temp.reopen().unwrap();
+        file.rewind().unwrap();
+        let mut trace = String::new();
+        file.read_to_string(&mut trace).unwrap();
+        trace
+    }
+
+    /// Replays `trace` the same way as [`replay`] and returns the resulting reactor.
+    pub(in crate::actor::reactor) fn replay_trace(trace: &str) -> Reactor {
+        let (tx, mut rx) = unbounded_channel();
+        DESERIALIZE_THREAD_HANDLE
+            .with(|h| h.borrow_mut().replace(AppThreadHandle::new_for_test(tx)));
+        std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+        let mut lines = trace.lines();
+        let config = ron::de::from_str(lines.next().expect("config line")).unwrap();
+        let layout = ron::de::from_str(lines.next().expect("layout line")).unwrap();
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor =
+            Reactor::new(Arc::new(config), layout, Record::new(None), group_indicators_tx);
+        for line in lines {
+            let event: Event = ron::de::from_str(line)
+                .unwrap_or_else(|e| panic!("failed to parse trace line {line:?}: {e}"));
+            reactor.handle_event(event);
+        }
+        reactor
+    }
+}

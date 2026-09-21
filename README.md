@@ -84,6 +84,46 @@ To install Glide as a service to run at login, use:
 glide service install
 ```
 
+### Scratchpad windows
+
+A scratchpad is an app window that you show and hide with one key, over
+whatever desktop you are on, like a password manager or a music player. Mark
+the app's window with a window rule and bind `toggle_scratchpad` to a key:
+
+```toml
+[settings]
+# Keep the default key bindings when adding your own.
+default_keys = true
+
+[keys]
+# ⌘⌥K
+"Meta + Alt + K" = { toggle_scratchpad = { name = "keyguard", launch = "com.artemchep.keyguard" } }
+
+[[window_rules]]
+if.app_id = "com.artemchep.keyguard"
+scratchpad = "keyguard"
+frame = { x = 0.2, y = 0.1, width = 0.6, height = 0.8 }  # optional
+```
+
+The key shows the window at `frame` on the current desktop and focuses it, and
+hides the app (like ⌘H) when the window is already visible and focused. If the
+app has no window yet, the key opens the app with the bundle id in `launch`.
+The window always floats. To find an app's bundle id, run:
+
+```
+defaults read /Applications/Keyguard.app/Contents/Info CFBundleIdentifier
+```
+
+Some limitations:
+
+- Each scratchpad has one window, and hiding hides all of the app's windows.
+- The window is not moved onto a desktop that shows a fullscreen app. Moving
+  windows between desktops requires macOS 26 or later.
+- If the app was running before Glide started and its window is on a desktop
+  you have not visited since, macOS switches to that desktop instead.
+
+See `scratchpad` and `toggle_scratchpad` in [glide.default.toml] for details.
+
 ## Manual installation
 
 [Download the latest release][latest] from the releases page.

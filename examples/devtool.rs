@@ -23,7 +23,9 @@ use glide_wm::sys::screen::{self, ScreenCache};
 use glide_wm::sys::window_server::{
     self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
 };
-use glide_wm::sys::{self};
+use glide_wm::sys::{
+    space_move, {self},
+};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{
     NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions, NSWorkspace,
@@ -58,6 +60,8 @@ enum Command {
     App(App),
     #[command(subcommand)]
     WindowServer(WindowServer),
+    #[command(subcommand)]
+    Space(Space),
     #[command()]
     Replay(Replay),
     #[command(subcommand)]
@@ -160,6 +164,17 @@ impl NotifyWindows {
     }
 }
 
+#[derive(Subcommand, Clone)]
+enum Space {
+    /// Print the spaces a window is on.
+    Window { window_server_id: CGWindowID },
+    /// Move a window to a space and print the spaces it is on afterwards.
+    MoveWindow {
+        window_server_id: CGWindowID,
+        space_id: u64,
+    },
+}
+
 #[derive(Parser, Clone)]
 struct Replay {
     path: PathBuf,
@@ -227,6 +242,25 @@ async fn main() -> anyhow::Result<()> {
             let ns_screens = screen::get_ns_screens(mtm);
             println!("Frames: {:?}", sc.update_screen_config(ns_screens));
             println!("Spaces: {:?}", sc.get_screen_spaces());
+        }
+        Command::Space(Space::Window { window_server_id }) => {
+            let wsid = WindowServerId::new(window_server_id);
+            println!("{:?}", space_move::spaces_for_window(wsid));
+        }
+        Command::Space(Space::MoveWindow { window_server_id, space_id }) => {
+            let wsid = WindowServerId::new(window_server_id);
+            let space = space_move::space_id_from_raw(space_id).context("space id is 0")?;
+            println!("before: {:?}", space_move::spaces_for_window(wsid));
+            let start = Instant::now();
+            space_move::move_window_to_space(wsid, space)?;
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                println!(
+                    "{:?}: {:?}",
+                    start.elapsed(),
+                    space_move::spaces_for_window(wsid)
+                );
+            }
         }
         Command::App(App::SetMainWindow { pid, window_server_id, wait }) => {
             let app = AXUIElement::application(pid);

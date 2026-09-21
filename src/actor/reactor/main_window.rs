@@ -77,6 +77,10 @@ impl MainWindowTracker {
                 (pid, quiet)
             }
             Event::ApplicationTerminated(..)
+            | Event::ApplicationHiddenChanged(..)
+            | Event::ScratchpadShowExpired(..)
+            | Event::ScratchpadMoveEnded(..)
+            | Event::ScreenSpacesChanged(..)
             | Event::StartupComplete
             | Event::WindowsDiscovered { .. }
             | Event::WindowCreated(..)
@@ -103,6 +107,11 @@ impl MainWindowTracker {
             }
         }
         None
+    }
+
+    /// The main window the app last reported, whether or not it is active.
+    pub fn app_main_window(&self, pid: pid_t) -> Option<WindowId> {
+        self.apps.get(&pid)?.main_window
     }
 
     /// The main window of the active app, if any.

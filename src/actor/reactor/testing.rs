@@ -91,10 +91,19 @@ pub fn make_windows(count: usize) -> Vec<WindowInfo> {
     (1..=count).map(make_window).collect()
 }
 
+type AppChannel = (
+    UnboundedSender<(Span, Request)>,
+    UnboundedReceiver<(Span, Request)>,
+);
+
 pub struct Apps {
-    tx: UnboundedSender<(Span, Request)>,
-    rx: UnboundedReceiver<(Span, Request)>,
+    /// One request channel per app, so requests can be attributed to a pid.
+    channels: BTreeMap<pid_t, AppChannel>,
     pub windows: BTreeMap<WindowId, WindowState>,
+    /// The hidden state last requested with [`Request::SetHidden`], per app.
+    pub hidden: BTreeMap<pid_t, bool>,
+    /// Windows that were asked to unminimize, in order.
+    pub unminimized: Vec<WindowId>,
 }
 
 #[derive(Default, PartialEq, Debug, Clone)]
@@ -106,11 +115,11 @@ pub struct WindowState {
 
 impl Apps {
     pub fn new() -> Apps {
-        let (tx, rx) = unbounded_channel();
         Apps {
-            tx,
-            rx,
+            channels: BTreeMap::new(),
             windows: BTreeMap::new(),
+            hidden: BTreeMap::new(),
+            unminimized: Vec::new(),
         }
     }
 
@@ -156,7 +165,8 @@ impl Apps {
                 },
             );
         }
-        let handle = AppThreadHandle::new_for_test(self.tx.clone());
+        let (tx, _) = self.channels.entry(pid).or_insert_with(unbounded_channel);
+        let handle = AppThreadHandle::new_for_test(tx.clone());
         let mut events = vec![];
         if with_ws_info {
             let ws_info: Vec<WindowServerInfo> = windows
@@ -180,6 +190,7 @@ impl Apps {
             info: AppInfo {
                 bundle_id: Some(format!("com.testapp{pid}")),
                 localized_name: Some(format!("TestApp{pid}")),
+                is_hidden: false,
             },
             handle,
             is_frontmost,
@@ -190,35 +201,62 @@ impl Apps {
     }
 
     pub fn requests(&mut self) -> Vec<Request> {
+        self.tagged_requests().into_iter().map(|(_, req)| req).collect()
+    }
+
+    /// Pending requests with the pid of the app they were sent to, grouped by
+    /// app in pid order.
+    pub fn tagged_requests(&mut self) -> Vec<(pid_t, Request)> {
         let mut requests = Vec::new();
-        while let Ok((_, req)) = self.rx.try_recv() {
-            requests.push(req);
+        for (&pid, (_, rx)) in &mut self.channels {
+            while let Ok((_, req)) = rx.try_recv() {
+                requests.push((pid, req));
+            }
         }
         requests
     }
 
     pub fn simulate_until_quiet(&mut self, reactor: &mut Reactor) {
-        let mut requests = self.requests();
+        let mut requests = self.tagged_requests();
         while !requests.is_empty() {
-            for event in self.simulate_events_for_requests(requests) {
+            for event in self.simulate_events_for_tagged_requests(requests) {
                 reactor.handle_event(event);
             }
-            requests = self.requests();
+            requests = self.tagged_requests();
         }
     }
 
     pub fn simulate_events(&mut self) -> Vec<Event> {
-        let requests = self.requests();
-        self.simulate_events_for_requests(requests)
+        let requests = self.tagged_requests();
+        self.simulate_events_for_tagged_requests(requests)
     }
 
+    /// Like [`Self::simulate_events_for_tagged_requests`], for requests whose app
+    /// is unknown. Panics on requests that need the pid.
     pub fn simulate_events_for_requests(&mut self, requests: Vec<Request>) -> Vec<Event> {
+        self.simulate(requests.into_iter().map(|req| (None, req)).collect())
+    }
+
+    pub fn simulate_events_for_tagged_requests(
+        &mut self,
+        requests: Vec<(pid_t, Request)>,
+    ) -> Vec<Event> {
+        self.simulate(requests.into_iter().map(|(pid, req)| (Some(pid), req)).collect())
+    }
+
+    fn simulate(&mut self, requests: Vec<(Option<pid_t>, Request)>) -> Vec<Event> {
         let mut events = vec![];
         let mut got_visible_windows = false;
-        for request in requests {
+        let mut terminated = Vec::new();
+        for (pid, request) in requests {
             debug!(?request);
+            // A terminated app answers nothing after Terminate. Requests with an
+            // unknown app all count as the same app.
+            if terminated.contains(&pid) {
+                continue;
+            }
             match request {
-                Request::Terminate => break,
+                Request::Terminate => terminated.push(pid),
                 Request::GetVisibleWindows => {
                     // Only do this once per cycle, since we simulate responding
                     // from all apps.
@@ -288,6 +326,12 @@ impl Apps {
                 }
                 Request::Raise(..) => todo!(),
                 Request::WindowDestroyed(..) => todo!(),
+                Request::SetHidden(hidden) => {
+                    let pid = pid.expect("SetHidden needs the app pid; use tagged_requests");
+                    self.hidden.insert(pid, hidden);
+                    events.push(Event::ApplicationHiddenChanged(pid, hidden));
+                }
+                Request::Unminimize(wid) => self.unminimized.push(wid),
             }
         }
         debug!(?events);

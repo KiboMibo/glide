@@ -1,0 +1,106 @@
+{
+  "skill": "coding-test",
+  "status": "FAIL",
+  "date": "2026-09-16",
+  "branch": "test/R3-tests",
+  "commits": ["9ab1755", "d7dce25"],
+  "scope": {
+    "source": "plan:docs/plans/2026-09-16-scratchpad.md#R3-test",
+    "files": [
+      "src/actor/layout.rs",
+      "src/actor/reactor.rs",
+      "src/actor/reactor/testing.rs",
+      "src/config.rs",
+      "src/sys/app.rs",
+      "glide.default.toml"
+    ]
+  },
+  "tests": {
+    "added": 21,
+    "run_command": "cargo test --no-fail-fast",
+    "baseline": { "passed": 345, "failed": 0 },
+    "final": { "passed": 365, "failed": 1, "doc_passed": 7 },
+    "failing": [
+      "actor::reactor::tests::scratchpad::edge_cases::removed_rule_stops_the_window_being_a_scratchpad_after_reload"
+    ],
+    "flaky": []
+  },
+  "coverage": {
+    "changed_lines_pct": 99,
+    "threshold": 80,
+    "threshold_met": true,
+    "repo_pct": null,
+    "basis": "ручная оценка по исполняемым строкам diff (cargo llvm-cov не установлен), подтверждена мутациями; не исполняется только src/actor/reactor.rs:386 (настоящий launcher в Reactor::spawn)"
+  },
+  "findings": [
+    {
+      "severity": "important",
+      "title": "Удалённое правило не снимает с окна статус scratchpad после перезагрузки конфига",
+      "file": "src/actor/layout.rs",
+      "line": 1204,
+      "impact": "Окно остаётся в реестре: старый toggle его прячет, ToggleWindowFloating не работает, в раскладку не вернуть до закрытия окна.",
+      "suggestion": "В register_scratchpad при отсутствии правила вызывать self.scratchpads.remove_window(wid); проверено: cargo test --lib 366/366.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::removed_rule_stops_the_window_being_a_scratchpad_after_reload"
+    },
+    {
+      "severity": "important",
+      "title": "Выбор scratchpad-окна среди нескольких подходящих зависит от порядка FxHashSet",
+      "file": "src/actor/reactor.rs",
+      "line": 1001,
+      "impact": "У приложения с несколькими окнами scratchpad может стать второстепенное окно.",
+      "suggestion": "Регистрировать окна приложения детерминированно (главное первым, далее по WindowId) или документировать title_regex.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::only_the_scratchpad_window_of_a_two_window_app_is_shown"
+    },
+    {
+      "severity": "important",
+      "title": "Окно на выключенном столе не регистрируется: toggle повторно запускает приложение и не может его спрятать",
+      "file": "src/actor/reactor.rs",
+      "line": 1009,
+      "impact": "Повторные open -b; отложенный показ срабатывает позже, когда окно попадёт на включённый стол.",
+      "suggestion": "Решение человека: регистрировать scratchpad-окна независимо от включённости space либо документировать.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::launched_window_on_a_disabled_space_is_left_alone"
+    },
+    {
+      "severity": "note",
+      "title": "Зарегистрированный scratchpad двигается и фокусируется на выключенном столе",
+      "file": "src/actor/reactor.rs",
+      "line": 1256,
+      "impact": "Непоследовательно с находкой про незарегистрированные окна.",
+      "suggestion": "Зафиксировать в плане, что scratchpad работает на выключенных столах.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::registered_scratchpad_is_shown_while_the_space_is_disabled"
+    },
+    {
+      "severity": "note",
+      "title": "Второе окно приложения становится scratchpad только при следующем обновлении окон",
+      "file": "src/actor/layout.rs",
+      "line": 675,
+      "impact": "Toggle между закрытием и обновлением вызывает open -b; показ срабатывает с задержкой.",
+      "suggestion": "Учесть вместе с находкой о выборе окна.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::remaining_window_of_the_app_takes_over_after_the_next_refresh"
+    },
+    {
+      "severity": "note",
+      "title": "Двойное нажатие во время запуска вызывает launcher дважды",
+      "file": "src/actor/reactor.rs",
+      "line": 1226,
+      "impact": "Безвредно: окно показывается один раз.",
+      "suggestion": "Оставить или не запускать повторно при живом отложенном показе.",
+      "test": "actor::reactor::tests::scratchpad::edge_cases::second_toggle_before_the_window_appears_shows_it_once"
+    },
+    {
+      "severity": "note",
+      "title": "Очистка scratchpad_to_show в AppClosed/WindowRemoved избыточна (эквивалентные мутанты)",
+      "file": "src/actor/layout.rs",
+      "line": 648,
+      "impact": "Нет.",
+      "suggestion": "Можно убрать или оставить как защиту."
+    }
+  ],
+  "sensitivity_check": {
+    "spot_check": { "tests_checked": 37, "detected_defect": 35, "note": "37 ручных мутаций; 2 выживших эквивалентны (M19, M20)" },
+    "not_overspecified": { "checked": true, "green_after_fix": true },
+    "mutation": { "run": false, "reason": "cargo-mutants в проекте не настроен; выполнены ручные мутации" }
+  },
+  "report_md": "docs/plans/reviews/scratchpad-R3-test.md",
+  "next_action": "Завести в F3 находку 1 (однострочная правка проверена); находки 2-3 решить с человеком; основной сценарий раздела 2 не заблокирован."
+}
