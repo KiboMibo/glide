@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.15-kibo.1](https://github.com/KiboMibo/glide/compare/v0.2.15...v0.2.15-kibo.1) (2026-09-21)
+
+Fork release on top of 0.2.15. Adds scratchpad windows: show and hide an app with one key over the current space, like yabai's scratchpad. See "Scratchpad windows" in the README.
+
+### Features
+
+* Add scratchpad windows with the `scratchpad` window rule and the `toggle_scratchpad` command ([3b540b9](https://github.com/KiboMibo/glide/commit/3b540b9))
+
+### Bug Fixes
+
+* Fix a crash when an app reports a window with a zero window server id, seen with Control Center on macOS 27 ([329d95e](https://github.com/KiboMibo/glide/commit/329d95e), [tmandry/glide#247](https://github.com/tmandry/glide/issues/247))
+* Avoid registering a window twice when its window server id appears late ([7ecc1ba](https://github.com/KiboMibo/glide/commit/7ecc1ba))
+
 ## [0.2.15](https://github.com/tmandry/glide/compare/v0.2.14...v0.2.15) (2026-08-09)
 
 When a window is floated, Glide now remembers the original size and position of the window. This release brings a ton of reliability improvements for when windows move between spaces and screens, focus changes, and windows are resized or floated. It also improves compatibility with certain apps.
