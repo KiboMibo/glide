@@ -40,11 +40,12 @@ use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
 use crate::collections::{HashMap, HashSet};
-use crate::config::Config;
+use crate::config::{Config, ScrollModifier};
 use crate::log::{self, MetricsCommand};
 use crate::model::scratchpad::{
     FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState,
 };
+use crate::model::scroll_viewport::ScrollPhase;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
@@ -214,10 +215,19 @@ pub enum Event {
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
     ),
 
+    /// For continuous (trackpad) events the deltas are in points; for mouse
+    /// wheel events they are in lines.
     ScrollWheel {
         delta_x: f64,
         delta_y: f64,
+        /// Also set in `modifiers`; kept so older recordings replay.
         alt_held: bool,
+        #[serde(default)]
+        modifiers: ScrollModifiers,
+        #[serde(default)]
+        continuous: bool,
+        #[serde(default)]
+        phase: ScrollPhase,
     },
 
     Command(Command),
@@ -226,6 +236,26 @@ pub enum Event {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Requested(pub bool);
+
+/// Modifier keys held during a scroll event.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollModifiers {
+    pub alt: bool,
+    pub ctrl: bool,
+    pub cmd: bool,
+    pub shift: bool,
+}
+
+impl ScrollModifiers {
+    pub fn contains(&self, modifier: ScrollModifier) -> bool {
+        match modifier {
+            ScrollModifier::Alt => self.alt,
+            ScrollModifier::Ctrl => self.ctrl,
+            ScrollModifier::Cmd => self.cmd,
+            ScrollModifier::Shift => self.shift,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -919,23 +949,41 @@ impl Reactor {
                 let msg = raise::Event::RaiseTimeout { sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
             }
-            Event::ScrollWheel { delta_x, delta_y, alt_held } => {
-                if !self.config.settings.experimental.scroll.enable {
+            Event::ScrollWheel {
+                delta_x,
+                delta_y,
+                alt_held,
+                modifiers,
+                continuous,
+                phase,
+            } => {
+                let scroll_config = &self.config.settings.experimental.scroll;
+                if !scroll_config.enable {
                     return;
                 }
-                // TODO: Make the modifier key configurable.
-                if !alt_held {
+                let modifiers = ScrollModifiers {
+                    alt: modifiers.alt || alt_held,
+                    ..modifiers
+                };
+                // Gesture start and end events pass without the modifier so
+                // that they still reset the scroll progress, but carry no
+                // movement.
+                let (delta_x, delta_y) = if modifiers.contains(scroll_config.scroll_modifier) {
+                    (delta_x, delta_y)
+                } else if matches!(phase, ScrollPhase::Began | ScrollPhase::Ended) {
+                    (0.0, 0.0)
+                } else {
                     return;
-                }
+                };
                 if let Some(&screen) = self.active_screen() {
                     if let Some(space) = screen.space {
-                        let scroll_config = &self.config.settings.experimental.scroll;
-                        let delta = if delta_x != 0.0 { delta_x } else { delta_y };
                         let response = self.layout.handle_scroll_wheel(
                             space,
-                            delta,
+                            delta_x,
+                            delta_y,
+                            continuous,
+                            phase,
                             &screen.frame,
-                            scroll_config,
                         );
                         self.handle_layout_response(response);
                     }
@@ -3816,6 +3864,546 @@ pub mod tests {
                     t.reactor.layout.pending_scratchpad_show("m")
                 );
                 assert!(replayed.layout.pending_scratchpad_show("l").is_some());
+            }
+        }
+    }
+
+    mod scroll_wheel {
+        use test_log::test;
+
+        use super::*;
+        use crate::config::{Config, ScrollModifier};
+        use crate::model::LayoutKind;
+
+        const OLD_SCROLL_EVENT: &str = "ScrollWheel(delta_x:-1.0,delta_y:0.0,alt_held:true)";
+
+        fn scroll_reactor(modifier: ScrollModifier) -> (Reactor, Apps) {
+            let mut config = Config::default();
+            config.settings.default_disable = false;
+            config.settings.animate = false;
+            config.settings.default_layout_kind = LayoutKind::Scroll;
+            config.settings.experimental.scroll.enable = true;
+            config.settings.experimental.scroll.scroll_modifier = modifier;
+            let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+            let (group_indicators_tx, _) = crate::actor::channel();
+            let mut reactor = Reactor::new(
+                Arc::new(config),
+                LayoutManager::new_for_test(),
+                record,
+                group_indicators_tx,
+            );
+            reactor.handle_event(Event::ScreenParametersChanged {
+                frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(900., 900.))],
+                spaces: vec![Some(SpaceId::new(1))],
+                scale_factors: vec![2.0],
+                converter: CoordinateConverter::default(),
+                on_screen: Default::default(),
+            });
+            let mut apps = Apps::new();
+            reactor.handle_event(Event::ApplicationGloballyActivated(1));
+            reactor.handle_events(apps.make_app_with_opts(
+                1,
+                make_windows(3),
+                Some(WindowId::new(1, 1)),
+                true,
+            ));
+            reactor.handle_event(Event::StartupComplete);
+            apps.simulate_until_quiet(&mut reactor);
+            assert_eq!(selected(&mut reactor), Some(WindowId::new(1, 1)));
+            (reactor, apps)
+        }
+
+        fn wheel(modifiers: ScrollModifiers) -> Event {
+            Event::ScrollWheel {
+                delta_x: -1.0,
+                delta_y: 0.0,
+                alt_held: modifiers.alt,
+                modifiers,
+                continuous: false,
+                phase: ScrollPhase::None,
+            }
+        }
+
+        fn selected(reactor: &mut Reactor) -> Option<WindowId> {
+            reactor.layout.selected_window(SpaceId::new(1))
+        }
+
+        #[test]
+        fn configured_modifier_gates_scrolling() {
+            let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Ctrl);
+            let start = selected(&mut reactor);
+
+            reactor.handle_event(wheel(ScrollModifiers {
+                alt: true,
+                ..Default::default()
+            }));
+            assert_eq!(selected(&mut reactor), start);
+
+            reactor.handle_event(wheel(ScrollModifiers {
+                ctrl: true,
+                ..Default::default()
+            }));
+            let after_ctrl = selected(&mut reactor);
+            assert_ne!(after_ctrl, start);
+
+            reactor.handle_event(wheel(ScrollModifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            }));
+            assert_ne!(selected(&mut reactor), after_ctrl);
+        }
+
+        #[test]
+        fn alt_is_the_default_modifier() {
+            assert_eq!(
+                Config::default().settings.experimental.scroll.scroll_modifier,
+                ScrollModifier::Alt
+            );
+            let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+            let start = selected(&mut reactor);
+
+            reactor.handle_event(wheel(ScrollModifiers {
+                ctrl: true,
+                ..Default::default()
+            }));
+            assert_eq!(selected(&mut reactor), start);
+
+            reactor.handle_event(wheel(ScrollModifiers {
+                alt: true,
+                ..Default::default()
+            }));
+            assert_ne!(selected(&mut reactor), start);
+        }
+
+        #[test]
+        fn old_scroll_event_deserializes_as_alt_mouse_wheel() {
+            let event: Event = ron::de::from_str(OLD_SCROLL_EVENT).unwrap();
+            let Event::ScrollWheel {
+                delta_x,
+                delta_y,
+                alt_held,
+                modifiers,
+                continuous,
+                phase,
+            } = event
+            else {
+                panic!("unexpected event {event:?}");
+            };
+            assert_eq!((delta_x, delta_y, alt_held), (-1.0, 0.0, true));
+            assert_eq!(modifiers, ScrollModifiers::default());
+            assert!(!continuous);
+            assert_eq!(phase, ScrollPhase::None);
+        }
+
+        #[test]
+        fn old_trace_replays_scroll_events() {
+            let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+            let start = selected(&mut reactor);
+            reactor.handle_event(wheel(ScrollModifiers {
+                alt: true,
+                ..Default::default()
+            }));
+            let after = selected(&mut reactor);
+            assert_ne!(after, start);
+
+            let trace = replay::tests::recorded_trace(&mut reactor);
+            let old_trace = trace
+                .lines()
+                .enumerate()
+                .map(|(idx, line)| {
+                    if idx == 0 {
+                        assert!(line.contains("scroll_modifier:alt,"));
+                        line.replace("scroll_modifier:alt,", "")
+                    } else if line.starts_with("ScrollWheel(") {
+                        OLD_SCROLL_EVENT.to_string()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .join("\n");
+            assert!(old_trace.contains(OLD_SCROLL_EVENT));
+
+            let mut replayed = replay::tests::replay_trace(&old_trace);
+            assert_eq!(selected(&mut replayed), after);
+        }
+
+        /// R1-test: modifier gating, trackpad phases and serialization through
+        /// the Reactor.
+        mod r1 {
+            use test_log::test;
+
+            use super::*;
+
+            const ALL: [ScrollModifier; 4] = [
+                ScrollModifier::Alt,
+                ScrollModifier::Ctrl,
+                ScrollModifier::Cmd,
+                ScrollModifier::Shift,
+            ];
+
+            fn only(modifier: ScrollModifier) -> ScrollModifiers {
+                with(&[modifier])
+            }
+
+            fn with(held: &[ScrollModifier]) -> ScrollModifiers {
+                ScrollModifiers {
+                    alt: held.contains(&ScrollModifier::Alt),
+                    ctrl: held.contains(&ScrollModifier::Ctrl),
+                    cmd: held.contains(&ScrollModifier::Cmd),
+                    shift: held.contains(&ScrollModifier::Shift),
+                }
+            }
+
+            fn trackpad(
+                delta_x: f64,
+                delta_y: f64,
+                phase: ScrollPhase,
+                modifiers: ScrollModifiers,
+            ) -> Event {
+                Event::ScrollWheel {
+                    delta_x,
+                    delta_y,
+                    alt_held: modifiers.alt,
+                    modifiers,
+                    continuous: true,
+                    phase,
+                }
+            }
+
+            #[test]
+            fn each_modifier_alone_gates_scrolling() {
+                for configured in ALL {
+                    let (mut reactor, _apps) = scroll_reactor(configured);
+                    let start = selected(&mut reactor);
+
+                    reactor.handle_event(wheel(ScrollModifiers::default()));
+                    assert_eq!(selected(&mut reactor), start, "{configured:?}: no modifier");
+                    for other in ALL.into_iter().filter(|&m| m != configured) {
+                        reactor.handle_event(wheel(only(other)));
+                        assert_eq!(
+                            selected(&mut reactor),
+                            start,
+                            "{configured:?} configured, {other:?} held"
+                        );
+                    }
+                    let all_others: Vec<_> = ALL.into_iter().filter(|&m| m != configured).collect();
+                    reactor.handle_event(wheel(with(&all_others)));
+                    assert_eq!(
+                        selected(&mut reactor),
+                        start,
+                        "{configured:?} configured, all other modifiers held"
+                    );
+
+                    reactor.handle_event(wheel(only(configured)));
+                    assert_ne!(selected(&mut reactor), start, "{configured:?} held");
+                }
+            }
+
+            #[test]
+            fn extra_modifiers_do_not_block_the_configured_one() {
+                for configured in ALL {
+                    let others: Vec<_> = ALL.into_iter().filter(|&m| m != configured).collect();
+                    for mask in 1..(1 << others.len()) {
+                        let mut held = vec![configured];
+                        held.extend(
+                            others
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| mask & (1 << i) != 0)
+                                .map(|(_, &m)| m),
+                        );
+                        let (mut reactor, _apps) = scroll_reactor(configured);
+                        let start = selected(&mut reactor);
+                        reactor.handle_event(wheel(with(&held)));
+                        assert_ne!(selected(&mut reactor), start, "held {held:?}");
+                    }
+                }
+            }
+
+            #[test]
+            fn legacy_alt_held_does_not_satisfy_other_modifiers() {
+                for configured in [
+                    ScrollModifier::Ctrl,
+                    ScrollModifier::Cmd,
+                    ScrollModifier::Shift,
+                ] {
+                    let (mut reactor, _apps) = scroll_reactor(configured);
+                    let start = selected(&mut reactor);
+                    reactor.handle_event(ron::de::from_str(OLD_SCROLL_EVENT).unwrap());
+                    assert_eq!(selected(&mut reactor), start, "{configured:?}");
+                }
+            }
+
+            #[test]
+            fn trackpad_gesture_scrolls_one_column_and_ignores_momentum() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                let w = |idx| Some(WindowId::new(1, idx));
+
+                // One column once the fingers travel 40pt at the default
+                // sensitivity.
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                reactor.handle_event(trackpad(-15.0, 0.0, Changed, alt));
+                reactor.handle_event(trackpad(-15.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(1));
+                reactor.handle_event(trackpad(-15.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(2));
+                reactor.handle_event(trackpad(0.0, 0.0, Ended, alt));
+                for _ in 0..10 {
+                    reactor.handle_event(trackpad(-500.0, 0.0, Momentum, alt));
+                }
+                assert_eq!(selected(&mut reactor), w(2));
+            }
+
+            fn set_sensitivity(reactor: &mut Reactor, sensitivity: f64) {
+                let mut config = Config::default();
+                config.settings.default_disable = false;
+                config.settings.animate = false;
+                config.settings.default_layout_kind = LayoutKind::Scroll;
+                config.settings.experimental.scroll.enable = true;
+                config.settings.experimental.scroll.scroll_sensitivity = sensitivity;
+                reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+            }
+
+            #[test]
+            fn negative_sensitivity_from_config_is_clamped_for_trackpad() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                set_sensitivity(&mut reactor, -20.0);
+                let alt = only(ScrollModifier::Alt);
+                reactor.handle_event(wheel(alt));
+                let start = selected(&mut reactor);
+                assert_eq!(
+                    start,
+                    Some(WindowId::new(1, 2)),
+                    "a negative sensitivity must not reverse the wheel direction"
+                );
+
+                // Validation clamps the sensitivity to 0, so the trackpad does
+                // not scroll at all (and never in the opposite direction).
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                reactor.handle_event(trackpad(300.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), start);
+                reactor.handle_event(trackpad(-300.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), start);
+            }
+
+            #[test]
+            fn huge_sensitivity_from_config_is_clamped_for_trackpad() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                set_sensitivity(&mut reactor, 1.0e6);
+                let alt = only(ScrollModifier::Alt);
+                let start = selected(&mut reactor);
+
+                // Clamped to 100: one column per 8pt.
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                reactor.handle_event(trackpad(-1.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), start);
+            }
+
+            #[test]
+            fn trackpad_without_modifier_does_not_scroll() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let start = selected(&mut reactor);
+                let none = ScrollModifiers::default();
+                reactor.handle_event(trackpad(0.0, 0.0, Began, none));
+                for _ in 0..10 {
+                    reactor.handle_event(trackpad(-300.0, 0.0, Changed, none));
+                }
+                assert_eq!(selected(&mut reactor), start);
+            }
+
+            #[test]
+            fn gesture_phases_without_modifier_reset_progress() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                let none = ScrollModifiers::default();
+                let w = |idx| Some(WindowId::new(1, idx));
+
+                // The modifier is released before the fingers lift.
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                reactor.handle_event(trackpad(-30.0, 0.0, Changed, alt));
+                reactor.handle_event(trackpad(0.0, 0.0, Ended, none));
+                reactor.handle_event(trackpad(-100.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(1));
+
+                // The modifier is pressed after the fingers touch down.
+                reactor.handle_event(trackpad(0.0, 0.0, Began, none));
+                reactor.handle_event(trackpad(-30.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(1));
+                reactor.handle_event(trackpad(-10.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(2));
+
+                // Phase events without the modifier never scroll.
+                reactor.handle_event(trackpad(-1000.0, 0.0, Began, none));
+                reactor.handle_event(trackpad(-1000.0, 0.0, Ended, none));
+                assert_eq!(selected(&mut reactor), w(2));
+            }
+
+            #[test]
+            fn vertical_trackpad_swipe_falls_back_to_delta_y() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                reactor.handle_event(trackpad(0.0, -300.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), Some(WindowId::new(1, 2)));
+            }
+
+            #[test]
+            fn vertical_trackpad_swipe_with_horizontal_noise_uses_delta_y() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                for _ in 0..4 {
+                    reactor.handle_event(trackpad(1.0, -12.0, Changed, alt));
+                }
+                assert_eq!(selected(&mut reactor), Some(WindowId::new(1, 2)));
+            }
+
+            #[test]
+            fn momentum_inside_an_open_gesture_neither_scrolls_nor_counts() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                let w = |idx| Some(WindowId::new(1, idx));
+                reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                reactor.handle_event(trackpad(-30.0, 0.0, Changed, alt));
+                for _ in 0..10 {
+                    reactor.handle_event(trackpad(-500.0, 0.0, Momentum, alt));
+                }
+                reactor.handle_event(trackpad(-9.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(1));
+                reactor.handle_event(trackpad(-1.0, 0.0, Changed, alt));
+                assert_eq!(selected(&mut reactor), w(2));
+            }
+
+            #[test]
+            fn vertical_wheel_notch_with_modifier_scrolls() {
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                reactor.handle_event(Event::ScrollWheel {
+                    delta_x: 0.0,
+                    delta_y: -1.0,
+                    alt_held: true,
+                    modifiers: alt,
+                    continuous: false,
+                    phase: ScrollPhase::None,
+                });
+                assert_eq!(selected(&mut reactor), Some(WindowId::new(1, 2)));
+            }
+
+            #[test]
+            fn non_finite_trackpad_deltas_do_not_panic() {
+                use ScrollPhase::*;
+                let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                let alt = only(ScrollModifier::Alt);
+                for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                    reactor.handle_event(trackpad(bad, 0.0, Changed, alt));
+                    reactor.handle_event(trackpad(0.0, bad, Changed, alt));
+                    reactor.handle_event(wheel(alt));
+                }
+            }
+
+            #[test]
+            fn new_scroll_event_round_trips_through_ron() {
+                let event = trackpad(
+                    -12.0,
+                    3.0,
+                    ScrollPhase::Changed,
+                    with(&[ScrollModifier::Ctrl, ScrollModifier::Shift]),
+                );
+                let text = ron::ser::to_string(&event).unwrap();
+                let Event::ScrollWheel {
+                    delta_x,
+                    delta_y,
+                    alt_held,
+                    modifiers,
+                    continuous,
+                    phase,
+                } = ron::de::from_str(&text).unwrap()
+                else {
+                    panic!("unexpected event from {text}");
+                };
+                assert_eq!((delta_x, delta_y, alt_held), (-12.0, 3.0, false));
+                assert_eq!(modifiers, with(&[ScrollModifier::Ctrl, ScrollModifier::Shift]));
+                assert!(continuous);
+                assert_eq!(phase, ScrollPhase::Changed);
+            }
+
+            #[test]
+            fn scroll_event_with_only_some_new_fields_uses_defaults() {
+                let event: Event = ron::de::from_str(
+                    "ScrollWheel(delta_x:-40.0,delta_y:0.0,alt_held:false,continuous:true)",
+                )
+                .unwrap();
+                let Event::ScrollWheel {
+                    modifiers, continuous, phase, ..
+                } = event
+                else {
+                    panic!("unexpected event {event:?}");
+                };
+                assert_eq!(modifiers, ScrollModifiers::default());
+                assert!(continuous);
+                assert_eq!(phase, ScrollPhase::None);
+            }
+
+            mod r2 {
+                use test_log::test;
+
+                use super::*;
+
+                #[test]
+                fn gesture_phase_events_with_modifier_keep_their_delta() {
+                    use ScrollPhase::*;
+                    let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                    let alt = only(ScrollModifier::Alt);
+                    let w = |idx| Some(WindowId::new(1, idx));
+
+                    reactor.handle_event(trackpad(-40.0, 0.0, Began, alt));
+                    assert_eq!(selected(&mut reactor), w(2), "delta of Began");
+                    reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                    reactor.handle_event(trackpad(-30.0, 0.0, Changed, alt));
+                    reactor.handle_event(trackpad(-10.0, 0.0, Ended, alt));
+                    assert_eq!(selected(&mut reactor), w(3), "delta of Ended");
+                }
+
+                #[test]
+                fn huge_sensitivity_from_config_scrolls_one_column_per_8pt() {
+                    use ScrollPhase::*;
+                    let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                    set_sensitivity(&mut reactor, 1.0e6);
+                    let alt = only(ScrollModifier::Alt);
+                    let w = |idx| Some(WindowId::new(1, idx));
+
+                    reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                    reactor.handle_event(trackpad(-7.0, 0.0, Changed, alt));
+                    assert_eq!(selected(&mut reactor), w(1));
+                    reactor.handle_event(trackpad(-1.0, 0.0, Changed, alt));
+                    assert_eq!(selected(&mut reactor), w(2));
+                }
+
+                #[test]
+                fn nan_sensitivity_from_config_uses_default_for_trackpad() {
+                    use ScrollPhase::*;
+                    let (mut reactor, _apps) = scroll_reactor(ScrollModifier::Alt);
+                    set_sensitivity(&mut reactor, f64::NAN);
+                    let alt = only(ScrollModifier::Alt);
+                    let w = |idx| Some(WindowId::new(1, idx));
+
+                    reactor.handle_event(trackpad(0.0, 0.0, Began, alt));
+                    reactor.handle_event(trackpad(-39.0, 0.0, Changed, alt));
+                    assert_eq!(selected(&mut reactor), w(1));
+                    reactor.handle_event(trackpad(-1.0, 0.0, Changed, alt));
+                    assert_eq!(selected(&mut reactor), w(2));
+                    reactor.handle_event(wheel(alt));
+                    assert_eq!(selected(&mut reactor), w(3), "the wheel still scrolls");
+                }
             }
         }
     }

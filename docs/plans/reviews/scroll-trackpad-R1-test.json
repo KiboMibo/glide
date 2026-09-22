@@ -1,0 +1,101 @@
+{
+  "skill": "coding-test",
+  "status": "FAIL",
+  "date": "2026-09-21",
+  "branch": "test/R1-scroll",
+  "scope": {
+    "source": "plan:docs/plans/2026-09-21-scroll-trackpad.md#R1-test",
+    "files": [
+      "src/actor/layout.rs",
+      "src/actor/reactor.rs",
+      "src/actor/mouse.rs",
+      "src/model/scroll_viewport.rs",
+      "src/config.rs"
+    ]
+  },
+  "tests": {
+    "added": 40,
+    "run_command": "cargo test --no-fail-fast",
+    "baseline": { "passed": 485, "failed": 0 },
+    "final": { "passed": 522, "failed": 3 },
+    "failing": [
+      "actor::layout::tests::r1_scroll_wheel::mouse_wheel_notch_after_partial_trackpad_swipe_moves_one_column",
+      "actor::reactor::tests::scroll_wheel::r1::negative_sensitivity_from_config_is_clamped_for_trackpad",
+      "actor::reactor::tests::scroll_wheel::r1::huge_sensitivity_from_config_is_clamped_for_trackpad"
+    ],
+    "flaky": []
+  },
+  "coverage": {
+    "changed_lines_pct": null,
+    "threshold": 80,
+    "threshold_met": null,
+    "notes": "cargo-llvm-cov/tarpaulin not installed; not installed for one run. Uncovered by design: CGEvent field reads in src/actor/mouse.rs:187-225 (need a live event tap)."
+  },
+  "findings": [
+    {
+      "severity": "important",
+      "title": "Leftover partial trackpad progress swallows an opposite mouse wheel notch",
+      "file": "src/actor/layout.rs",
+      "line": 1491,
+      "impact": "Violates plan criterion 3 (one notch = one column) after a partial swipe.",
+      "suggestion": "Reset scroll progress on Ended as well as Began (or before a discrete wheel step).",
+      "test": "actor::layout::tests::r1_scroll_wheel::mouse_wheel_notch_after_partial_trackpad_swipe_moves_one_column"
+    },
+    {
+      "severity": "important",
+      "title": "scroll_sensitivity reaches handle_scroll_wheel without the validated() clamp",
+      "file": "src/actor/reactor.rs",
+      "line": 960,
+      "impact": "Negative sensitivity reverses trackpad and wheel; >100 lets 1pt of movement scroll up to 16 columns.",
+      "suggestion": "Use self.scroll_cfg (validated) inside handle_scroll_wheel instead of the raw config parameter.",
+      "test": "actor::reactor::tests::scroll_wheel::r1::negative_sensitivity_from_config_is_clamped_for_trackpad"
+    },
+    {
+      "severity": "note",
+      "title": "scroll_sensitivity = nan passes validation and silently disables scrolling (pre-existing)",
+      "file": "src/config.rs",
+      "line": 284,
+      "impact": "No panic; wheel scrolling stays broken, trackpad until next Began.",
+      "suggestion": "Reject or default non-finite values in validated()."
+    },
+    {
+      "severity": "note",
+      "title": "Non-finite delta poisons scroll_progress for wheel events",
+      "file": "src/model/scroll_viewport.rs",
+      "line": 144,
+      "impact": "Only reachable from edited traces; no panic.",
+      "suggestion": "Ignore non-finite delta in accumulate_scroll."
+    },
+    {
+      "severity": "note",
+      "title": "Began/Ended dropped when the modifier is not held",
+      "file": "src/actor/reactor.rs",
+      "line": 968,
+      "impact": "Pressing the modifier mid-gesture continues old leftover progress.",
+      "suggestion": "Forward phase-only resets regardless of modifier, or accept."
+    },
+    {
+      "severity": "note",
+      "title": "Vertical swipe scrolls columns via delta_y fallback (documented in T1, out of scope)",
+      "file": "src/actor/reactor.rs",
+      "line": 973,
+      "impact": "Diagonal swipes add vertical movement to column scrolling.",
+      "suggestion": "Human decision."
+    },
+    {
+      "severity": "note",
+      "title": "Smooth-scrolling mice report continuous events and get the pixel threshold",
+      "file": "src/actor/mouse.rs",
+      "line": 188,
+      "impact": "Such mice may need many notches per column.",
+      "suggestion": "Add to R1-qa live check."
+    }
+  ],
+  "sensitivity_check": {
+    "spot_check": { "tests_checked": 28, "detected_defect": 28 },
+    "not_overspecified": { "checked": true, "green_after_fix": true },
+    "mutation": { "run": true, "tool": "manual (target/r1/mut.sh)", "mutants": 28, "killed": 28, "survived": 0 }
+  },
+  "report_md": "docs/plans/reviews/scroll-trackpad-R1-test.md",
+  "next_action": "Open F1 for findings 1-2 (reset on Ended; use validated scroll config in handle_scroll_wheel); merge test/R1-scroll with or after F1."
+}

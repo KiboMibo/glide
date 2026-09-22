@@ -15,8 +15,9 @@ use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_foundation::{MainThreadMarker, NSInteger};
 use tracing::{debug, error, warn};
 
-use super::reactor::{self, Event};
+use super::reactor::{self, Event, ScrollModifiers};
 use crate::config::Config;
+use crate::model::scroll_viewport::ScrollPhase;
 use crate::sys::event;
 use crate::sys::geometry::{CGRectExt, ToICrate};
 use crate::sys::screen::CoordinateConverter;
@@ -184,20 +185,69 @@ impl Mouse {
                 }
             }
             CGEventType::ScrollWheel => {
-                let delta_y = event
-                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                    as f64;
-                let delta_x = event
-                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
-                    as f64;
+                let continuous = event
+                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS)
+                    != 0;
+                let (axis_1, axis_2) = if continuous {
+                    (
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                    )
+                } else {
+                    (
+                        EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                        EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+                    )
+                };
+                let delta_y = event.get_integer_value_field(axis_1) as f64;
+                let delta_x = event.get_integer_value_field(axis_2) as f64;
+                let phase = scroll_phase(
+                    event.get_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE),
+                    event.get_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE),
+                );
 
-                if delta_x != 0.0 || delta_y != 0.0 {
-                    let alt_held = event.get_flags().contains(CGEventFlags::CGEventFlagAlternate);
-                    self.events_tx.send(Event::ScrollWheel { delta_x, delta_y, alt_held });
+                if delta_x != 0.0 || delta_y != 0.0 || phase != ScrollPhase::None {
+                    let flags = event.get_flags();
+                    let modifiers = ScrollModifiers {
+                        alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
+                        ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
+                        cmd: flags.contains(CGEventFlags::CGEventFlagCommand),
+                        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                    };
+                    self.events_tx.send(Event::ScrollWheel {
+                        delta_x,
+                        delta_y,
+                        alt_held: modifiers.alt,
+                        modifiers,
+                        continuous,
+                        phase,
+                    });
                 }
             }
             _ => (),
         }
+    }
+}
+
+// kCGScrollWheelEventScrollPhase and kCGScrollWheelEventMomentumPhase from
+// CGEventTypes.h; core-graphics 0.25 does not define them.
+const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99;
+const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123;
+
+/// Maps the CGScrollPhase and CGMomentumScrollPhase field values of a scroll
+/// event.
+fn scroll_phase(scroll_phase: i64, momentum_phase: i64) -> ScrollPhase {
+    if momentum_phase != 0 {
+        return ScrollPhase::Momentum;
+    }
+    match scroll_phase {
+        // kCGScrollPhaseBegan, kCGScrollPhaseMayBegin
+        1 | 128 => ScrollPhase::Began,
+        // kCGScrollPhaseChanged
+        2 => ScrollPhase::Changed,
+        // kCGScrollPhaseEnded, kCGScrollPhaseCancelled
+        4 | 8 => ScrollPhase::Ended,
+        _ => ScrollPhase::None,
     }
 }
 
@@ -277,3 +327,36 @@ pub type NSWindowLevel = NSInteger;
 pub const NSMainMenuWindowLevel: NSWindowLevel = 24;
 #[allow(non_upper_case_globals)]
 pub const NSPopUpMenuWindowLevel: NSWindowLevel = 101;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_phase_maps_cg_values() {
+        assert_eq!(scroll_phase(0, 0), ScrollPhase::None);
+        assert_eq!(scroll_phase(1, 0), ScrollPhase::Began);
+        assert_eq!(scroll_phase(128, 0), ScrollPhase::Began);
+        assert_eq!(scroll_phase(2, 0), ScrollPhase::Changed);
+        assert_eq!(scroll_phase(4, 0), ScrollPhase::Ended);
+        assert_eq!(scroll_phase(8, 0), ScrollPhase::Ended);
+        for momentum in 1..=3 {
+            assert_eq!(scroll_phase(0, momentum), ScrollPhase::Momentum);
+        }
+    }
+
+    #[test]
+    fn momentum_phase_wins_over_scroll_phase() {
+        for scroll in [1, 2, 4, 8, 128] {
+            assert_eq!(scroll_phase(scroll, 2), ScrollPhase::Momentum, "{scroll}");
+        }
+        assert_eq!(scroll_phase(0, -1), ScrollPhase::Momentum);
+    }
+
+    #[test]
+    fn unknown_scroll_phase_values_map_to_none() {
+        for scroll in [-1, 3, 5, 16, 64, 129, 256, i64::MAX, i64::MIN] {
+            assert_eq!(scroll_phase(scroll, 0), ScrollPhase::None, "{scroll}");
+        }
+    }
+}

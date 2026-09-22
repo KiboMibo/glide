@@ -20,7 +20,7 @@ use crate::config::{Config, NewWindowPlacement, ScrollConfig, WindowRule, Window
 use crate::model::scratchpad::{
     FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState, Scratchpads,
 };
-use crate::model::scroll_viewport::ViewportState;
+use crate::model::scroll_viewport::{ScrollPhase, ViewportState, dominant_axis};
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
     SpaceLayoutMapping,
@@ -206,6 +206,13 @@ struct InteractiveScrollMove {
 
 const RESIZE_EDGE_THRESHOLD: f64 = 8.0;
 const MOVE_DRAG_THRESHOLD: f64 = 10.0;
+/// Trackpad finger travel, in point deltas, that moves one column at the
+/// reference sensitivity. It does not depend on the screen width because the
+/// trackpad is the same size on every screen.
+const TRACKPAD_SWIPE_PT: f64 = 40.0;
+/// `scroll_sensitivity` at which a trackpad swipe of `TRACKPAD_SWIPE_PT`
+/// moves one column; the default in `glide.default.toml`.
+const CONTINUOUS_SCROLL_REFERENCE_SENSITIVITY: f64 = 20.0;
 
 /// Actor that manages the layouts for each space.
 ///
@@ -1439,14 +1446,19 @@ impl LayoutManager {
         }
     }
 
+    /// The deltas are in points for continuous (trackpad) events and in lines
+    /// for mouse wheel events. A positive delta on either axis moves to the
+    /// previous column.
     pub fn handle_scroll_wheel(
         &mut self,
         space: SpaceId,
         delta_x: f64,
+        delta_y: f64,
+        continuous: bool,
+        phase: ScrollPhase,
         screen: &CGRect,
-        config: &crate::config::ScrollConfig,
     ) -> EventResponse {
-        if !self.scroll_enabled {
+        if !self.scroll_enabled || phase == ScrollPhase::Momentum {
             return EventResponse::default();
         }
         let layout = self.layout(space);
@@ -1462,26 +1474,45 @@ impl LayoutManager {
 
         let step_threshold = screen.size.width / col_count.min(3) as f64;
 
-        let delta = if config.invert_scroll_direction {
-            -delta_x
+        let sensitivity = self.scroll_cfg.scroll_sensitivity;
+        let (dx, dy) = if self.scroll_cfg.invert_scroll_direction {
+            (-delta_x, -delta_y)
         } else {
-            delta_x
-        };
-        let scaled_delta = delta * config.scroll_sensitivity;
-
-        let is_discrete = delta_x.abs() < 10.0 && delta_x.fract() == 0.0;
-        let (effective_delta, effective_threshold) = if is_discrete {
-            (scaled_delta.signum() * step_threshold, step_threshold)
-        } else {
-            (scaled_delta, step_threshold)
+            (delta_x, delta_y)
         };
 
         let vp = self.viewport_mut(layout, screen.size.width);
         vp.set_screen_width(screen.size.width);
 
-        let steps = match vp.accumulate_scroll(effective_delta, effective_threshold) {
-            Some(s) => s,
-            None => return EventResponse::default(),
+        let steps = if continuous {
+            let scale = sensitivity / CONTINUOUS_SCROLL_REFERENCE_SENSITIVITY;
+            if phase == ScrollPhase::None {
+                // No gesture boundaries: one column per swipe distance.
+                vp.accumulate_scroll(dominant_axis(dx, dy) * scale, TRACKPAD_SWIPE_PT)
+            } else {
+                if phase == ScrollPhase::Began {
+                    vp.swipe.begin();
+                }
+                let steps = vp.swipe.add(dx * scale, dy * scale, TRACKPAD_SWIPE_PT);
+                if phase == ScrollPhase::Ended {
+                    vp.swipe.end();
+                }
+                steps
+            }
+        } else {
+            let delta = dominant_axis(dx, dy);
+            let is_discrete = delta.abs() < 10.0 && delta.fract() == 0.0;
+            if delta == 0.0 {
+                None
+            } else if is_discrete {
+                vp.reset_scroll_progress();
+                vp.accumulate_scroll(delta.signum() * step_threshold, step_threshold)
+            } else {
+                vp.accumulate_scroll(delta * sensitivity, step_threshold)
+            }
+        };
+        let Some(steps) = steps else {
+            return EventResponse::default();
         };
 
         let selection = self.tree.selection(layout);
@@ -3614,10 +3645,151 @@ mod tests {
 
         let config_off = config_with_scroll(false, LayoutKind::Tree);
         mgr.set_config(&config_off);
-        let response =
-            mgr.handle_scroll_wheel(space, -1.0, &screen, &config_off.settings.experimental.scroll);
+        let response = mgr.handle_scroll_wheel(space, -1.0, 0.0, false, ScrollPhase::None, &screen);
         assert!(response.raise_windows.is_empty());
         assert!(response.focus_window.is_none());
+    }
+
+    fn scroll_wheel_fixture(
+        configure: impl FnOnce(&mut crate::config::ScrollConfig),
+    ) -> (LayoutManager, SpaceId, CGRect) {
+        use LayoutEvent::*;
+
+        let mut config = Config::default();
+        config.settings.experimental.scroll.enable = true;
+        config.settings.default_layout_kind = LayoutKind::Scroll;
+        configure(&mut config.settings.experimental.scroll);
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&Arc::new(config));
+
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 900, 600);
+        let pid = 1;
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 3)));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+        assert_eq!(mgr.active_layout_kind(space), LayoutKind::Scroll);
+        (mgr, space, screen)
+    }
+
+    // With 3 columns on a 900pt screen the wheel step is 300pt. A trackpad
+    // gesture moves one column once the fingers travel 40pt at the default
+    // sensitivity.
+    fn trackpad(
+        mgr: &mut LayoutManager,
+        space: SpaceId,
+        screen: &CGRect,
+        delta: f64,
+        phase: ScrollPhase,
+    ) -> Option<WindowId> {
+        _ = mgr.handle_scroll_wheel(space, delta, 0.0, true, phase, screen);
+        mgr.selected_window(space)
+    }
+
+    #[test]
+    fn mouse_wheel_notch_moves_one_column() {
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|_| {});
+        _ = mgr.handle_scroll_wheel(space, -1.0, 0.0, false, ScrollPhase::None, &screen);
+        assert_eq!(mgr.selected_window(space), Some(WindowId::new(1, 2)));
+        _ = mgr.handle_scroll_wheel(space, 1.0, 0.0, false, ScrollPhase::None, &screen);
+        assert_eq!(mgr.selected_window(space), Some(WindowId::new(1, 1)));
+    }
+
+    #[test]
+    fn trackpad_gesture_moves_one_column_once_the_swipe_threshold_is_reached() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|_| {});
+        let w = |idx| Some(WindowId::new(1, idx));
+
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Began), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -20.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -19.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        // The rest of the gesture moves nothing.
+        assert_eq!(trackpad(&mut mgr, space, &screen, -500.0, Changed), w(2));
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Ended), w(2));
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Began), w(2));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -40.0, Changed), w(3));
+    }
+
+    #[test]
+    fn trackpad_scroll_threshold_scales_with_sensitivity() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|c| c.scroll_sensitivity = 40.0);
+        assert_eq!(
+            trackpad(&mut mgr, space, &screen, -19.0, Changed),
+            Some(WindowId::new(1, 1))
+        );
+        assert_eq!(
+            trackpad(&mut mgr, space, &screen, -1.0, Changed),
+            Some(WindowId::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn trackpad_momentum_neither_scrolls_nor_accumulates() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|_| {});
+        let w = |idx| Some(WindowId::new(1, idx));
+
+        assert_eq!(trackpad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -1000.0, Momentum), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -1000.0, Momentum), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -9.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+    }
+
+    #[test]
+    fn trackpad_gesture_start_resets_progress() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|_| {});
+        let w = |idx| Some(WindowId::new(1, idx));
+
+        assert_eq!(trackpad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Ended), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Began), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -10.0, Changed), w(2));
+    }
+
+    #[test]
+    fn trackpad_threshold_does_not_depend_on_screen_width() {
+        use ScrollPhase::*;
+        let (mut mgr, space, _) = scroll_wheel_fixture(|_| {});
+        let wide = rect(0, 0, 3000, 600);
+        let w = |idx| Some(WindowId::new(1, idx));
+
+        assert_eq!(trackpad(&mut mgr, space, &wide, -39.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &wide, -1.0, Changed), w(2));
+    }
+
+    #[test]
+    fn trackpad_gesture_end_discards_leftover_progress() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|_| {});
+        let w = |idx| Some(WindowId::new(1, idx));
+
+        assert_eq!(trackpad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, 0.0, Ended), w(1));
+        assert_eq!(trackpad(&mut mgr, space, &screen, -100.0, Changed), w(1));
+    }
+
+    #[test]
+    fn trackpad_scroll_respects_invert_direction() {
+        use ScrollPhase::*;
+        let (mut mgr, space, screen) = scroll_wheel_fixture(|c| c.invert_scroll_direction = true);
+        assert_eq!(
+            trackpad(&mut mgr, space, &screen, 300.0, Changed),
+            Some(WindowId::new(1, 2))
+        );
+        assert_eq!(
+            trackpad(&mut mgr, space, &screen, 0.0, Began),
+            Some(WindowId::new(1, 2))
+        );
+        assert_eq!(
+            trackpad(&mut mgr, space, &screen, -300.0, Changed),
+            Some(WindowId::new(1, 1))
+        );
     }
 
     #[test]
@@ -3669,5 +3841,813 @@ mod tests {
             ]
         );
         assert_eq!(response.focus_window, Some(WindowId::new(1, 2)));
+    }
+
+    /// R1-test: edge cases of `handle_scroll_wheel` for trackpad and wheel events.
+    mod r1_scroll_wheel {
+        use ScrollPhase::*;
+        use pretty_assertions::assert_eq;
+        use test_log::test;
+
+        use super::*;
+        use crate::config::ScrollConfig;
+
+        // 900pt screen: with 3+ columns the wheel step is 300pt. A trackpad
+        // gesture moves one column once the fingers travel 40pt at the
+        // default sensitivity.
+        fn fixture(
+            windows: u32,
+            configure: impl FnOnce(&mut ScrollConfig),
+        ) -> (LayoutManager, SpaceId, CGRect) {
+            use LayoutEvent::*;
+
+            let mut config = Config::default();
+            config.settings.experimental.scroll.enable = true;
+            config.settings.default_layout_kind = LayoutKind::Scroll;
+            configure(&mut config.settings.experimental.scroll);
+            let mut mgr = LayoutManager::new_for_test();
+            mgr.set_config(&Arc::new(config));
+
+            let space = SpaceId::new(1);
+            let screen = rect(0, 0, 900, 600);
+            _ = mgr.handle_event(SpaceExposed(space, screen.size));
+            _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, windows)));
+            _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(1, 1)));
+            assert_eq!(mgr.active_layout_kind(space), LayoutKind::Scroll);
+            (mgr, space, screen)
+        }
+
+        fn w(idx: u32) -> Option<WindowId> {
+            Some(WindowId::new(1, idx))
+        }
+
+        fn pad(
+            mgr: &mut LayoutManager,
+            space: SpaceId,
+            screen: &CGRect,
+            delta: f64,
+            phase: ScrollPhase,
+        ) -> Option<WindowId> {
+            _ = mgr.handle_scroll_wheel(space, delta, 0.0, true, phase, screen);
+            mgr.selected_window(space)
+        }
+
+        fn wheel(
+            mgr: &mut LayoutManager,
+            space: SpaceId,
+            screen: &CGRect,
+            delta: f64,
+        ) -> Option<WindowId> {
+            _ = mgr.handle_scroll_wheel(space, delta, 0.0, false, None, screen);
+            mgr.selected_window(space)
+        }
+
+        fn assert_no_response(response: EventResponse) {
+            assert!(response.focus_window.is_none());
+            assert!(response.raise_windows.is_empty());
+        }
+
+        #[test]
+        fn zero_sensitivity_trackpad_never_scrolls_and_keeps_progress_finite() {
+            let (mut mgr, space, screen) = fixture(3, |c| c.scroll_sensitivity = 0.0);
+            for _ in 0..50 {
+                assert_eq!(pad(&mut mgr, space, &screen, -10_000.0, Changed), w(1));
+            }
+            let mut full = Config::default();
+            full.settings.experimental.scroll.enable = true;
+            full.settings.default_layout_kind = LayoutKind::Scroll;
+            full.settings.experimental.scroll.scroll_sensitivity = 20.0;
+            mgr.set_config(&Arc::new(full));
+            assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        }
+
+        #[test]
+        fn zero_sensitivity_mouse_wheel_still_moves_one_column_per_notch() {
+            let (mut mgr, space, screen) = fixture(3, |c| c.scroll_sensitivity = 0.0);
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0), w(2));
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0), w(3));
+            assert_eq!(wheel(&mut mgr, space, &screen, 1.0), w(2));
+        }
+
+        #[test]
+        fn large_wheel_sensitivity_still_moves_one_column_per_notch() {
+            let (mut mgr, space, screen) = fixture(5, |c| c.scroll_sensitivity = 100.0);
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0), w(2));
+            assert_eq!(wheel(&mut mgr, space, &screen, -3.0), w(3));
+        }
+
+        #[test]
+        fn mouse_wheel_notch_after_partial_trackpad_swipe_moves_one_column() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -250.0, Changed), w(2));
+            // A partial swipe that does not reach the next column.
+            assert_eq!(pad(&mut mgr, space, &screen, -200.0, Changed), w(2));
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Ended), w(2));
+
+            assert_eq!(
+                wheel(&mut mgr, space, &screen, 1.0),
+                w(1),
+                "one wheel notch must move one column regardless of leftover trackpad progress"
+            );
+        }
+
+        #[test]
+        fn huge_trackpad_delta_moves_at_most_16_columns() {
+            let (mut mgr, space, screen) = fixture(20, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0e7, None), w(17));
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(17));
+            assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(17));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(18));
+        }
+
+        #[test]
+        fn huge_non_discrete_wheel_delta_moves_at_most_16_columns() {
+            let (mut mgr, space, screen) = fixture(20, |_| {});
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0e9), w(17));
+        }
+
+        #[test]
+        fn single_column_scroll_is_a_noop() {
+            let (mut mgr, space, screen) = fixture(1, |_| {});
+            for phase in [Began, Changed, Ended, None] {
+                assert_no_response(
+                    mgr.handle_scroll_wheel(space, -1000.0, 0.0, true, phase, &screen),
+                );
+            }
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0), w(1));
+            assert_eq!(wheel(&mut mgr, space, &screen, 1.0), w(1));
+        }
+
+        #[test]
+        fn empty_scroll_layout_ignores_scroll_events() {
+            use LayoutEvent::*;
+            let mut config = Config::default();
+            config.settings.experimental.scroll.enable = true;
+            config.settings.default_layout_kind = LayoutKind::Scroll;
+            let mut mgr = LayoutManager::new_for_test();
+            mgr.set_config(&Arc::new(config));
+            let space = SpaceId::new(1);
+            let screen = rect(0, 0, 900, 600);
+            _ = mgr.handle_event(SpaceExposed(space, screen.size));
+            for (continuous, phase) in [(true, Began), (true, Changed), (false, None)] {
+                assert_no_response(
+                    mgr.handle_scroll_wheel(space, -1000.0, 0.0, continuous, phase, &screen),
+                );
+            }
+        }
+
+        #[test]
+        fn zero_delta_phase_events_do_not_scroll() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            for phase in [Began, Changed, Changed, Ended, None, Momentum] {
+                assert_eq!(pad(&mut mgr, space, &screen, 0.0, phase), w(1));
+            }
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        }
+
+        #[test]
+        fn began_with_movement_resets_progress_before_counting_its_delta() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -20.0, Began), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -19.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        }
+
+        #[test]
+        fn momentum_is_ignored_in_both_directions_and_for_wheel_events() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -300.0, Changed), w(2));
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Ended), w(2));
+            for delta in [-5000.0, 5000.0, -300.0, 300.0] {
+                assert_eq!(pad(&mut mgr, space, &screen, delta, Momentum), w(2));
+            }
+            assert_no_response(mgr.handle_scroll_wheel(space, -1.0, 0.0, false, Momentum, &screen));
+            assert_eq!(mgr.selected_window(space), w(2));
+        }
+
+        #[test]
+        fn reversing_direction_within_a_gesture_cancels_progress() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, 30.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        }
+
+        #[test]
+        fn trackpad_invert_direction_applies_to_partial_progress() {
+            let (mut mgr, space, screen) = fixture(3, |c| c.invert_scroll_direction = true);
+            assert_eq!(pad(&mut mgr, space, &screen, 39.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, 1.0, Changed), w(2));
+            assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(2));
+            assert_eq!(pad(&mut mgr, space, &screen, -40.0, Changed), w(1));
+        }
+
+        #[test]
+        fn wheel_invert_direction_flips_notches() {
+            let (mut mgr, space, screen) = fixture(3, |c| c.invert_scroll_direction = true);
+            assert_eq!(wheel(&mut mgr, space, &screen, 1.0), w(2));
+            assert_eq!(wheel(&mut mgr, space, &screen, -1.0), w(1));
+        }
+
+        #[test]
+        fn non_finite_deltas_do_not_panic_and_next_gesture_recovers() {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let (mut mgr, space, screen) = fixture(3, |_| {});
+                _ = mgr.handle_scroll_wheel(space, bad, 0.0, true, Changed, &screen);
+                _ = mgr.handle_scroll_wheel(space, bad, 0.0, false, None, &screen);
+                _ = mgr.handle_scroll_wheel(space, bad, 0.0, true, Momentum, &screen);
+
+                let start = pad(&mut mgr, space, &screen, 0.0, Began);
+                let dir = if start == w(3) { 1.0 } else { -1.0 };
+                assert_eq!(
+                    pad(&mut mgr, space, &screen, dir * 30.0, Changed),
+                    start,
+                    "{bad}: progress must be reset by Began"
+                );
+                assert_ne!(
+                    pad(&mut mgr, space, &screen, dir * 30.0, Changed),
+                    start,
+                    "{bad}: scrolling must work again after Began"
+                );
+            }
+        }
+
+        #[test]
+        fn switching_space_mid_gesture_does_not_carry_progress() {
+            use LayoutEvent::*;
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            let other = SpaceId::new(2);
+            _ = mgr.handle_event(SpaceExposed(other, screen.size));
+            _ = mgr.handle_event(WindowsOnScreenUpdated(other, 2, make_windows(2, 3)));
+            _ = mgr.handle_event(WindowFocused(vec![other], WindowId::new(2, 1)));
+            let o = |idx| Some(WindowId::new(2, idx));
+            assert_eq!(mgr.selected_window(other), o(1));
+
+            assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, other, &screen, -30.0, Changed), o(1));
+            assert_eq!(mgr.selected_window(space), w(1));
+            assert_eq!(pad(&mut mgr, other, &screen, -10.0, Changed), o(2));
+        }
+
+        #[test]
+        fn layout_kind_change_mid_gesture_is_safe() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+
+            _ = mgr.handle_command(Some(space), &[space], LayoutCommand::ChangeLayoutKind);
+            assert_eq!(mgr.active_layout_kind(space), LayoutKind::Tree);
+            assert_no_response(
+                mgr.handle_scroll_wheel(space, -1000.0, 0.0, true, Changed, &screen),
+            );
+
+            _ = mgr.handle_command(Some(space), &[space], LayoutCommand::ChangeLayoutKind);
+            assert_eq!(mgr.active_layout_kind(space), LayoutKind::Scroll);
+            let start = pad(&mut mgr, space, &screen, 0.0, Began);
+            let dir = if start == w(3) { 1.0 } else { -1.0 };
+            assert_eq!(pad(&mut mgr, space, &screen, dir * 39.0, Changed), start);
+            assert_ne!(pad(&mut mgr, space, &screen, dir * 1.0, Changed), start);
+        }
+
+        #[test]
+        fn two_columns_use_the_same_trackpad_threshold() {
+            let (mut mgr, space, screen) = fixture(2, |_| {});
+            assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(1));
+            assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+        }
+
+        #[test]
+        fn scroll_disabled_ignores_trackpad() {
+            let (mut mgr, space, screen) = fixture(3, |_| {});
+            mgr.set_config(&config_with_scroll(false, LayoutKind::Scroll));
+            assert_no_response(
+                mgr.handle_scroll_wheel(space, -1000.0, 0.0, true, Changed, &screen),
+            );
+        }
+
+        mod r2 {
+            use pretty_assertions::assert_eq;
+            use test_log::test;
+
+            use super::*;
+
+            #[test]
+            fn gesture_end_counts_its_delta_before_discarding_leftover() {
+                let (mut mgr, space, screen) = fixture(5, |_| {});
+                assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+                assert_eq!(
+                    pad(&mut mgr, space, &screen, -10.0, Ended),
+                    w(2),
+                    "the delta of Ended completes the column"
+                );
+
+                assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(2));
+                assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(2));
+                assert_eq!(pad(&mut mgr, space, &screen, -9.0, Ended), w(2));
+                assert_eq!(
+                    pad(&mut mgr, space, &screen, -10.0, Changed),
+                    w(2),
+                    "leftover after Ended must be discarded"
+                );
+            }
+
+            #[test]
+            fn trackpad_swipe_per_column_is_40pt_times_20_over_sensitivity() {
+                for (sensitivity, swipe) in [(10.0, 80.0), (40.0, 20.0), (100.0, 8.0)] {
+                    let (mut mgr, space, screen) =
+                        fixture(3, |c| c.scroll_sensitivity = sensitivity);
+                    assert_eq!(
+                        pad(&mut mgr, space, &screen, -(swipe - 1.0), Changed),
+                        w(1),
+                        "sensitivity {sensitivity}"
+                    );
+                    assert_eq!(
+                        pad(&mut mgr, space, &screen, -1.0, Changed),
+                        w(2),
+                        "sensitivity {sensitivity}"
+                    );
+                }
+            }
+
+            #[test]
+            fn nan_sensitivity_in_config_uses_default_trackpad_threshold() {
+                let (mut mgr, space, screen) = fixture(3, |c| c.scroll_sensitivity = f64::NAN);
+                assert_eq!(pad(&mut mgr, space, &screen, -39.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+            }
+
+            #[test]
+            fn fast_wheel_uses_screen_column_step_not_trackpad_threshold() {
+                // Non-discrete wheel deltas are scaled by the sensitivity (20)
+                // and counted against the 300pt column step.
+                let (mut mgr, space, screen) = fixture(3, |_| {});
+                assert_eq!(wheel(&mut mgr, space, &screen, -12.5), w(1));
+                assert_eq!(wheel(&mut mgr, space, &screen, -2.5), w(2));
+            }
+
+            #[test]
+            fn gesture_start_without_prior_end_resets_progress() {
+                let (mut mgr, space, screen) = fixture(3, |_| {});
+                assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, 0.0, Began), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, -10.0, Changed), w(2));
+            }
+
+            #[test]
+            fn partial_reversal_subtracts_from_progress() {
+                let (mut mgr, space, screen) = fixture(3, |_| {});
+                assert_eq!(pad(&mut mgr, space, &screen, -30.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, 10.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, -19.0, Changed), w(1));
+                assert_eq!(pad(&mut mgr, space, &screen, -1.0, Changed), w(2));
+            }
+        }
+
+        /// F2: one swipe moves one column along the dominant axis. The numbers
+        /// come from a recorded trace of a MacBook trackpad.
+        mod f2 {
+            use pretty_assertions::assert_eq;
+            use test_log::test;
+
+            use super::*;
+
+            /// Five columns with the middle one selected.
+            fn middle(
+                configure: impl FnOnce(&mut ScrollConfig),
+            ) -> (LayoutManager, SpaceId, CGRect) {
+                let (mut mgr, space, screen) = fixture(5, configure);
+                _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 3)));
+                assert_eq!(mgr.selected_window(space), w(3));
+                (mgr, space, screen)
+            }
+
+            fn event(
+                mgr: &mut LayoutManager,
+                space: SpaceId,
+                screen: &CGRect,
+                (dx, dy): (f64, f64),
+                continuous: bool,
+                phase: ScrollPhase,
+            ) -> Option<WindowId> {
+                _ = mgr.handle_scroll_wheel(space, dx, dy, continuous, phase, screen);
+                mgr.selected_window(space)
+            }
+
+            /// Sends a whole gesture: MayBegin and Began (both arrive as
+            /// `Began`), `moves` as `Changed`, `Ended`, then momentum.
+            fn gesture(
+                mgr: &mut LayoutManager,
+                space: SpaceId,
+                screen: &CGRect,
+                moves: &[(f64, f64)],
+                momentum: (f64, f64),
+            ) -> Option<WindowId> {
+                event(mgr, space, screen, (0.0, 0.0), true, Began);
+                event(mgr, space, screen, (0.0, 0.0), true, Began);
+                for &delta in moves {
+                    event(mgr, space, screen, delta, true, Changed);
+                }
+                event(mgr, space, screen, (0.0, 0.0), true, Ended);
+                for _ in 0..10 {
+                    let (mx, my) = momentum;
+                    event(mgr, space, screen, (mx / 10.0, my / 10.0), true, Momentum);
+                }
+                mgr.selected_window(space)
+            }
+
+            /// `n` events that add up to `total`, with the remainder in the
+            /// last one.
+            fn split(total: (f64, f64), n: usize) -> Vec<(f64, f64)> {
+                let step = ((total.0 / n as f64).trunc(), (total.1 / n as f64).trunc());
+                let mut moves = vec![step; n - 1];
+                moves.push((
+                    total.0 - step.0 * (n - 1) as f64,
+                    total.1 - step.1 * (n - 1) as f64,
+                ));
+                moves
+            }
+
+            #[test]
+            fn split_adds_up() {
+                let moves = split((-11.0, 238.0), 13);
+                let sum = moves.iter().fold((0.0, 0.0), |a, m| (a.0 + m.0, a.1 + m.1));
+                assert_eq!((moves.len(), sum), (13, (-11.0, 238.0)));
+            }
+
+            #[test]
+            fn horizontal_swipes_from_the_trace_move_one_column_each() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &split((85.0, 5.0), 13), (515.0, 0.0)),
+                    w(2)
+                );
+                assert_eq!(
+                    gesture(
+                        &mut mgr,
+                        space,
+                        &screen,
+                        &split((-249.0, 9.0), 13),
+                        (-1518.0, 0.0)
+                    ),
+                    w(3)
+                );
+            }
+
+            #[test]
+            fn vertical_swipes_from_the_trace_move_one_column_each() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                // Fingers up (negative dy with natural scrolling): next column.
+                assert_eq!(
+                    gesture(
+                        &mut mgr,
+                        space,
+                        &screen,
+                        &split((4.0, -177.0), 13),
+                        (0.0, -600.0)
+                    ),
+                    w(4)
+                );
+                assert_eq!(
+                    gesture(
+                        &mut mgr,
+                        space,
+                        &screen,
+                        &split((-11.0, 238.0), 13),
+                        (0.0, 800.0)
+                    ),
+                    w(3)
+                );
+            }
+
+            #[test]
+            fn the_axis_is_chosen_by_total_travel_not_by_the_event() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                // Every event has a non-zero dx, but the gesture is vertical.
+                let moves = [(6.0, -1.0), (1.0, -20.0), (-1.0, -20.0)];
+                assert_eq!(gesture(&mut mgr, space, &screen, &moves, (0.0, 0.0)), w(4));
+            }
+
+            #[test]
+            fn swipe_shorter_than_40pt_does_not_scroll() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &split((39.0, 20.0), 13), (900.0, 0.0)),
+                    w(3)
+                );
+                assert_eq!(
+                    gesture(
+                        &mut mgr,
+                        space,
+                        &screen,
+                        &split((-10.0, -39.0), 13),
+                        (0.0, -900.0)
+                    ),
+                    w(3)
+                );
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &split((40.0, 0.0), 4), (0.0, 0.0)),
+                    w(2)
+                );
+            }
+
+            #[test]
+            fn sensitivity_40_halves_the_swipe_and_0_disables_it() {
+                let (mut mgr, space, screen) = middle(|c| c.scroll_sensitivity = 40.0);
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &[(19.0, 0.0)], (0.0, 0.0)),
+                    w(3)
+                );
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &[(20.0, 0.0)], (0.0, 0.0)),
+                    w(2)
+                );
+
+                let (mut mgr, space, screen) = middle(|c| c.scroll_sensitivity = 0.0);
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &[(1.0e6, 0.0)], (1.0e6, 0.0)),
+                    w(3)
+                );
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, 1.0e6), true, None), w(3));
+            }
+
+            #[test]
+            fn may_begin_then_began_after_movement_starts_a_fresh_gesture() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(event(&mut mgr, space, &screen, (30.0, 0.0), true, Changed), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, 0.0), true, Began), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, 0.0), true, Began), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (30.0, 0.0), true, Changed), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (10.0, 0.0), true, Changed), w(2));
+            }
+
+            #[test]
+            fn continuous_scroll_without_phases_moves_one_column_per_40pt() {
+                let (mut mgr, space, screen) = fixture(5, |_| {});
+                for _ in 0..10 {
+                    event(&mut mgr, space, &screen, (0.0, -10.0), true, None);
+                }
+                assert_eq!(mgr.selected_window(space), w(3));
+                // 20pt carried over.
+                assert_eq!(event(&mut mgr, space, &screen, (-20.0, 0.0), true, None), w(4));
+            }
+
+            #[test]
+            fn continuous_scroll_without_phases_uses_the_dominant_axis_of_each_event() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(event(&mut mgr, space, &screen, (-5.0, 39.0), true, None), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (1.0, 0.5), true, None), w(2));
+            }
+
+            #[test]
+            fn wheel_notch_on_either_axis_moves_one_column() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, -1.0), false, None), w(4));
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, 1.0), false, None), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (-1.0, 0.0), false, None), w(4));
+                assert_eq!(event(&mut mgr, space, &screen, (1.0, 0.0), false, None), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (1.0, -3.0), false, None), w(4));
+            }
+
+            #[test]
+            fn wheel_notch_ignores_leftover_continuous_progress() {
+                let (mut mgr, space, screen) = middle(|_| {});
+                assert_eq!(event(&mut mgr, space, &screen, (-39.0, 0.0), true, None), w(3));
+                assert_eq!(event(&mut mgr, space, &screen, (1.0, 0.0), false, None), w(2));
+            }
+
+            #[test]
+            fn invert_scroll_direction_flips_every_kind_of_event() {
+                let (mut mgr, space, screen) = middle(|c| c.invert_scroll_direction = true);
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, -1.0), false, None), w(2));
+                assert_eq!(event(&mut mgr, space, &screen, (1.0, 0.0), false, None), w(3));
+                assert_eq!(
+                    gesture(&mut mgr, space, &screen, &split((85.0, 5.0), 13), (515.0, 0.0)),
+                    w(4)
+                );
+                assert_eq!(
+                    gesture(
+                        &mut mgr,
+                        space,
+                        &screen,
+                        &split((4.0, -177.0), 13),
+                        (0.0, -600.0)
+                    ),
+                    w(3)
+                );
+                assert_eq!(event(&mut mgr, space, &screen, (0.0, 40.0), true, None), w(4));
+            }
+
+            /// Edge cases of the gesture boundaries and the axis choice.
+            mod edges {
+                use pretty_assertions::assert_eq;
+                use test_log::test;
+
+                use super::*;
+
+                fn pad2(
+                    mgr: &mut LayoutManager,
+                    space: SpaceId,
+                    screen: &CGRect,
+                    delta: (f64, f64),
+                    phase: ScrollPhase,
+                ) -> Option<WindowId> {
+                    event(mgr, space, screen, delta, true, phase)
+                }
+
+                #[test]
+                fn first_gesture_without_began_still_moves_only_one_column() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-39.0, 0.0), Changed), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-1.0, 0.0), Changed), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-500.0, 0.0), Changed), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -500.0), Ended), w(4));
+                }
+
+                #[test]
+                fn changed_after_ended_without_began_does_not_scroll() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(
+                        gesture(&mut mgr, space, &screen, &[(-10.0, 0.0)], (0.0, 0.0)),
+                        w(3)
+                    );
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-500.0, 0.0), Changed), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -500.0), Changed), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, 0.0), Began), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-40.0, 0.0), Changed), w(4));
+                }
+
+                #[test]
+                fn ended_without_began_counts_its_delta_only_in_an_open_gesture() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -40.0), Ended), w(4));
+                    // The gesture is closed: a second Ended moves nothing.
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -40.0), Ended), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -40.0), Changed), w(4));
+                }
+
+                #[test]
+                fn diagonal_swipe_at_45_degrees_uses_the_horizontal_axis() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    // Σ(40, −40): horizontal wins the tie, so previous column.
+                    assert_eq!(
+                        gesture(
+                            &mut mgr,
+                            space,
+                            &screen,
+                            &[(25.0, -25.0), (15.0, -15.0)],
+                            (0.0, 0.0)
+                        ),
+                        w(2)
+                    );
+                    // Σ(−40, 40): next column.
+                    assert_eq!(
+                        gesture(&mut mgr, space, &screen, &[(-40.0, 40.0)], (0.0, 0.0)),
+                        w(3)
+                    );
+                }
+
+                #[test]
+                fn axis_switches_when_the_other_axis_overtakes_mid_gesture() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    // Horizontal first, then a longer vertical travel.
+                    assert_eq!(
+                        gesture(
+                            &mut mgr,
+                            space,
+                            &screen,
+                            &[(35.0, 0.0), (0.0, -45.0)],
+                            (0.0, 0.0)
+                        ),
+                        w(4)
+                    );
+                    // x passes 40 in the same event in which y overtakes it:
+                    // Σ(41, −45) moves along y.
+                    assert_eq!(
+                        gesture(
+                            &mut mgr,
+                            space,
+                            &screen,
+                            &[(39.0, 0.0), (2.0, -45.0)],
+                            (0.0, 0.0)
+                        ),
+                        w(5)
+                    );
+                }
+
+                #[test]
+                fn single_huge_event_moves_exactly_one_column() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(
+                        gesture(&mut mgr, space, &screen, &[(-1.0e6, 0.0)], (-1.0e7, 0.0)),
+                        w(4)
+                    );
+                    assert_eq!(
+                        gesture(&mut mgr, space, &screen, &[(0.0, 1.0e6)], (0.0, 1.0e7)),
+                        w(3)
+                    );
+                    // The delta of Began itself.
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-1.0e6, 0.0), Began), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-1.0e6, 0.0), Changed), w(4));
+                }
+
+                #[test]
+                fn two_gestures_without_ended_move_one_column_each() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, 0.0), Began), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-40.0, 0.0), Changed), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-40.0, 0.0), Changed), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, 0.0), Began), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, 0.0), Began), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-39.0, 0.0), Changed), w(4));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (-1.0, 0.0), Changed), w(5));
+                }
+
+                #[test]
+                fn momentum_inside_an_open_gesture_is_ignored() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, 0.0), Began), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -30.0), Changed), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -1000.0), Momentum), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -9.0), Changed), w(3));
+                    assert_eq!(pad2(&mut mgr, space, &screen, (0.0, -1.0), Changed), w(4));
+                }
+
+                #[test]
+                fn non_finite_vertical_delta_is_dropped_by_the_next_began() {
+                    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                        let (mut mgr, space, screen) = middle(|_| {});
+                        _ = pad2(&mut mgr, space, &screen, (0.0, bad), Changed);
+                        let start = mgr.selected_window(space);
+                        assert_eq!(
+                            pad2(&mut mgr, space, &screen, (0.0, 0.0), Began),
+                            start,
+                            "{bad}"
+                        );
+                        let dir = if start == w(5) { 1.0 } else { -1.0 };
+                        assert_eq!(
+                            pad2(&mut mgr, space, &screen, (0.0, dir * 39.0), Changed),
+                            start,
+                            "{bad}"
+                        );
+                        assert_ne!(
+                            pad2(&mut mgr, space, &screen, (0.0, dir * 1.0), Changed),
+                            start,
+                            "{bad}"
+                        );
+                    }
+                }
+
+                #[test]
+                fn vertical_continuous_scroll_without_phases_is_proportional() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(event(&mut mgr, space, &screen, (3.0, -80.0), true, None), w(5));
+                    assert_eq!(event(&mut mgr, space, &screen, (-3.0, 39.0), true, None), w(5));
+                    assert_eq!(event(&mut mgr, space, &screen, (0.0, 1.0), true, None), w(4));
+                }
+
+                #[test]
+                fn wheel_notch_at_45_degrees_uses_the_horizontal_axis() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    assert_eq!(event(&mut mgr, space, &screen, (1.0, -1.0), false, None), w(2));
+                    assert_eq!(event(&mut mgr, space, &screen, (-2.0, 2.0), false, None), w(3));
+                }
+
+                #[test]
+                fn zero_wheel_delta_does_not_scroll() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    for delta in [(0.0, 0.0), (-0.0, 0.0), (0.0, -0.0)] {
+                        assert_eq!(event(&mut mgr, space, &screen, delta, false, None), w(3));
+                    }
+                }
+
+                #[test]
+                fn vertical_gesture_with_horizontal_jitter_moves_along_y() {
+                    let (mut mgr, space, screen) = middle(|_| {});
+                    // Every event is horizontal-dominant, but dx cancels out:
+                    // Σ(20, −45) is vertical.
+                    let moves = [(20.0, -15.0), (-20.0, -15.0), (20.0, -15.0)];
+                    assert_eq!(gesture(&mut mgr, space, &screen, &moves, (0.0, 0.0)), w(4));
+                }
+
+                #[test]
+                fn invert_scroll_direction_flips_vertical_continuous_and_wheel() {
+                    let (mut mgr, space, screen) = middle(|c| c.invert_scroll_direction = true);
+                    assert_eq!(event(&mut mgr, space, &screen, (0.0, 1.0), false, None), w(4));
+                    assert_eq!(event(&mut mgr, space, &screen, (0.0, -40.0), true, None), w(3));
+                    assert_eq!(
+                        gesture(&mut mgr, space, &screen, &split((-11.0, 238.0), 13), (0.0, 0.0)),
+                        w(4)
+                    );
+                }
+            }
+        }
     }
 }

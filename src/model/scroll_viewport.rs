@@ -6,9 +6,67 @@
 use std::time::Instant;
 
 use objc2_core_foundation::CGRect;
+use serde::{Deserialize, Serialize};
 
 use super::spring::SpringAnimation;
 use crate::config::CenterMode;
+
+/// Phase of a trackpad scroll gesture. Mouse wheel events have no phase.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollPhase {
+    #[default]
+    None,
+    /// The fingers touched down or started moving.
+    Began,
+    Changed,
+    Ended,
+    /// Inertial scrolling after the fingers lifted.
+    Momentum,
+}
+
+/// Returns the delta along the axis that moved further; `dx` on a tie.
+pub fn dominant_axis(dx: f64, dy: f64) -> f64 {
+    if dx.abs() >= dy.abs() { dx } else { dy }
+}
+
+/// Finger travel of one trackpad gesture, from `Began` to `Ended`. A gesture
+/// moves at most one column.
+#[derive(Debug, Clone, Default)]
+pub struct SwipeGesture {
+    travel_x: f64,
+    travel_y: f64,
+    done: bool,
+}
+
+impl SwipeGesture {
+    pub fn begin(&mut self) {
+        *self = SwipeGesture::default();
+    }
+
+    /// Stops the gesture from moving any further columns until the next
+    /// `begin`.
+    pub fn end(&mut self) {
+        self.done = true;
+    }
+
+    /// Adds finger travel. Once the total travel along the dominant axis
+    /// reaches `threshold`, returns its sign as a single step and ends the
+    /// gesture.
+    pub fn add(&mut self, dx: f64, dy: f64, threshold: f64) -> Option<i32> {
+        if self.done || threshold <= 0.0 {
+            return None;
+        }
+        self.travel_x += dx;
+        self.travel_y += dy;
+        let travel = dominant_axis(self.travel_x, self.travel_y);
+        if travel.abs() >= threshold {
+            self.done = true;
+            Some(if travel < 0.0 { -1 } else { 1 })
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ScrollState {
@@ -39,6 +97,7 @@ pub struct ViewportState {
     pub screen_width: f64,
     pub user_scrolling: bool,
     pub scroll_progress: f64,
+    pub swipe: SwipeGesture,
 }
 
 impl ViewportState {
@@ -49,6 +108,7 @@ impl ViewportState {
             screen_width,
             user_scrolling: false,
             scroll_progress: 0.0,
+            swipe: SwipeGesture::default(),
         }
     }
 
@@ -141,6 +201,10 @@ impl ViewportState {
         }
     }
 
+    pub fn reset_scroll_progress(&mut self) {
+        self.scroll_progress = 0.0;
+    }
+
     pub fn is_animating(&self, now: Instant) -> bool {
         match &self.scroll {
             ScrollState::Static(_) => false,
@@ -224,6 +288,97 @@ mod tests {
 
     fn make_rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+    }
+
+    #[test]
+    fn accumulate_scroll_carries_remainder() {
+        let mut vp = ViewportState::new(1920.0);
+        assert_eq!(vp.accumulate_scroll(600.0, 960.0), None);
+        assert_eq!(vp.accumulate_scroll(600.0, 960.0), Some(1));
+        assert_eq!(vp.accumulate_scroll(720.0, 960.0), Some(1));
+        assert_eq!(vp.accumulate_scroll(-300.0, 960.0), None);
+    }
+
+    #[test]
+    fn accumulate_scroll_returns_multiple_steps_and_keeps_sign() {
+        let mut vp = ViewportState::new(1920.0);
+        assert_eq!(vp.accumulate_scroll(-2000.0, 960.0), Some(-2));
+        assert_eq!(vp.accumulate_scroll(-879.0, 960.0), None);
+        assert_eq!(vp.accumulate_scroll(-1.0, 960.0), Some(-1));
+    }
+
+    #[test]
+    fn accumulate_scroll_ignores_non_positive_threshold() {
+        let mut vp = ViewportState::new(0.0);
+        assert_eq!(vp.accumulate_scroll(1000.0, 0.0), None);
+        assert_eq!(vp.accumulate_scroll(1000.0, -1.0), None);
+        vp.reset_scroll_progress();
+        assert_eq!(vp.accumulate_scroll(960.0, 960.0), Some(1));
+    }
+
+    #[test]
+    fn reset_scroll_progress_recovers_from_non_finite_progress() {
+        let mut vp = ViewportState::new(1920.0);
+        _ = vp.accumulate_scroll(f64::NAN, 960.0);
+        vp.reset_scroll_progress();
+        assert_eq!(vp.accumulate_scroll(960.0, 960.0), Some(1));
+    }
+
+    #[test]
+    fn reset_scroll_progress_discards_partial_progress() {
+        let mut vp = ViewportState::new(1920.0);
+        assert_eq!(vp.accumulate_scroll(900.0, 960.0), None);
+        vp.reset_scroll_progress();
+        assert_eq!(vp.accumulate_scroll(900.0, 960.0), None);
+        assert_eq!(vp.accumulate_scroll(60.0, 960.0), Some(1));
+    }
+
+    #[test]
+    fn dominant_axis_picks_the_larger_magnitude() {
+        assert_eq!(dominant_axis(6.0, 1.0), 6.0);
+        assert_eq!(dominant_axis(4.0, -177.0), -177.0);
+        assert_eq!(dominant_axis(-3.0, 3.0), -3.0);
+    }
+
+    #[test]
+    fn swipe_moves_once_per_gesture_along_the_dominant_axis() {
+        let mut swipe = SwipeGesture::default();
+        swipe.begin();
+        assert_eq!(swipe.add(0.0, -30.0, 40.0), None);
+        assert_eq!(swipe.add(2.0, -10.0, 40.0), Some(-1));
+        assert_eq!(swipe.add(0.0, -500.0, 40.0), None);
+        swipe.end();
+        assert_eq!(swipe.add(500.0, 0.0, 40.0), None);
+
+        swipe.begin();
+        assert_eq!(swipe.add(39.0, 0.0, 40.0), None);
+        assert_eq!(swipe.add(1.0, 0.0, 40.0), Some(1));
+    }
+
+    #[test]
+    fn swipe_axis_follows_the_total_travel() {
+        let mut swipe = SwipeGesture::default();
+        assert_eq!(swipe.add(30.0, 5.0, 40.0), None);
+        // |Σdy| = 35 overtakes |Σdx| = 30 but stays below the threshold.
+        assert_eq!(swipe.add(0.0, 30.0, 40.0), None);
+        assert_eq!(swipe.add(0.0, 5.0, 40.0), Some(1));
+    }
+
+    #[test]
+    fn swipe_ignores_non_positive_threshold() {
+        let mut swipe = SwipeGesture::default();
+        assert_eq!(swipe.add(1000.0, 0.0, 0.0), None);
+        assert_eq!(swipe.add(1000.0, 0.0, -1.0), None);
+        assert_eq!(swipe.add(39.0, 0.0, 40.0), None);
+    }
+
+    #[test]
+    fn swipe_begin_recovers_from_non_finite_travel() {
+        let mut swipe = SwipeGesture::default();
+        assert_eq!(swipe.add(f64::NAN, 0.0, 40.0), None);
+        assert_eq!(swipe.add(100.0, 0.0, 40.0), None);
+        swipe.begin();
+        assert_eq!(swipe.add(-40.0, 0.0, 40.0), Some(-1));
     }
 
     #[test]

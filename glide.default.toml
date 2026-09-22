@@ -234,11 +234,25 @@ scroll.column_width_presets = [0.333, 0.5, 0.667, 1.0]
 # Where to place new windows: "new_column" or "same_column".
 scroll.new_window_in_column = "new_column"
 
-# Scroll sensitivity multiplier for trackpad/mouse wheel.
+# Trackpad scroll sensitivity (0-100). One two-finger swipe, horizontal or
+# vertical, moves exactly one column once the fingers travel
+# 40 * 20 / sensitivity points along it: 40pt at 20.0, 20pt at 40.0. 0 turns
+# trackpad scrolling off. Swiping left or up moves to the next column, right or
+# down to the previous one (with natural scrolling). Momentum after the fingers
+# lift does not move columns. Mice with smooth scrolling move one column per
+# the same distance.
+# A mouse wheel notch, vertical or horizontal, moves one column regardless of
+# this value.
 scroll.scroll_sensitivity = 20.0
 
-# Invert the scroll direction (natural scrolling).
+# Invert the scroll direction for both the trackpad and the mouse wheel.
 scroll.invert_scroll_direction = false
+
+# Modifier key for scrolling between columns: "alt", "ctrl", "cmd", or
+# "shift". Hold it and swipe two fingers across the trackpad, or turn
+# the mouse wheel. Other modifiers held at the same time are ignored. The app
+# under the pointer still receives the scroll events.
+scroll.scroll_modifier = "alt"
 
 # Allow focus to wrap around from last column to first and vice versa.
 scroll.infinite_loop = false

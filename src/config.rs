@@ -241,6 +241,19 @@ pub enum CenterMode {
     OnOverflow,
 }
 
+/// Modifier key that must be held for scroll gestures to move the scroll layout.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollModifier {
+    /// Used for recordings made before this setting existed, when the
+    /// modifier was always Alt. Config defaults come from `glide.default.toml`.
+    #[default]
+    Alt,
+    Ctrl,
+    Cmd,
+    Shift,
+}
+
 #[derive(PartialConfig!)]
 #[derive_args(ScrollConfigPartial)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -253,6 +266,8 @@ pub struct ScrollConfig {
     pub new_window_in_column: NewWindowPlacement,
     pub scroll_sensitivity: f64,
     pub invert_scroll_direction: bool,
+    #[serde(default)]
+    pub scroll_modifier: ScrollModifier,
     pub infinite_loop: bool,
     pub single_column_aspect_ratio: String,
 }
@@ -266,6 +281,9 @@ impl Default for ScrollConfig {
 impl ScrollConfig {
     pub fn validated(mut self) -> Self {
         self.visible_columns = self.visible_columns.clamp(1, 5);
+        if self.scroll_sensitivity.is_nan() {
+            self.scroll_sensitivity = Self::default().scroll_sensitivity;
+        }
         self.scroll_sensitivity = self.scroll_sensitivity.clamp(0.0, 100.0);
         self.column_width_presets.retain(|&p| p > 0.0 && p <= 1.0);
         self
@@ -556,6 +574,89 @@ mod tests {
     #[test]
     fn scroll_gate_is_disabled_by_default() {
         assert!(!Config::default().settings.experimental.scroll.enable);
+    }
+
+    #[test]
+    fn scroll_modifier_parses() {
+        let config =
+            Config::parse("[settings.experimental]\nscroll.scroll_modifier = \"ctrl\"").unwrap();
+        assert_eq!(
+            config.settings.experimental.scroll.scroll_modifier,
+            ScrollModifier::Ctrl
+        );
+    }
+
+    #[test]
+    fn unknown_scroll_modifier_is_rejected() {
+        assert!(
+            Config::parse("[settings.experimental]\nscroll.scroll_modifier = \"hyper\"").is_err()
+        );
+    }
+
+    fn parse_scroll(line: &str) -> Result<ScrollConfig, SpannedError> {
+        Config::parse(&format!("[settings.experimental]\n{line}"))
+            .map(|c| c.settings.experimental.scroll)
+    }
+
+    #[test]
+    fn every_scroll_modifier_value_parses() {
+        for (text, expected) in [
+            ("alt", ScrollModifier::Alt),
+            ("ctrl", ScrollModifier::Ctrl),
+            ("cmd", ScrollModifier::Cmd),
+            ("shift", ScrollModifier::Shift),
+        ] {
+            let scroll = parse_scroll(&format!("scroll.scroll_modifier = \"{text}\"")).unwrap();
+            assert_eq!(scroll.scroll_modifier, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn scroll_modifier_rejects_other_spellings_and_types() {
+        for value in [
+            "\"Alt\"",
+            "\"option\"",
+            "\"\"",
+            "\"alt+ctrl\"",
+            "1",
+            "[\"alt\"]",
+        ] {
+            assert!(
+                parse_scroll(&format!("scroll.scroll_modifier = {value}")).is_err(),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_modifier_defaults_to_alt_when_unset() {
+        assert_eq!(
+            parse_scroll("scroll.enable = true").unwrap().scroll_modifier,
+            ScrollModifier::Alt
+        );
+    }
+
+    #[test]
+    fn validated_scroll_sensitivity_is_clamped_to_zero_and_hundred() {
+        for (value, expected) in [("-5.0", 0.0), ("0.0", 0.0), ("1e9", 100.0), ("inf", 100.0)] {
+            let scroll = parse_scroll(&format!("scroll.scroll_sensitivity = {value}")).unwrap();
+            assert_eq!(scroll.validated().scroll_sensitivity, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn nan_scroll_sensitivity_does_not_panic() {
+        // TOML allows `nan`; `f64::clamp` keeps it as NaN.
+        let scroll = parse_scroll("scroll.scroll_sensitivity = nan").unwrap();
+        _ = scroll.validated();
+    }
+
+    #[test]
+    fn nan_scroll_sensitivity_falls_back_to_default() {
+        let default = ScrollConfig::default().scroll_sensitivity;
+        assert!(default.is_finite());
+        let scroll = parse_scroll("scroll.scroll_sensitivity = nan").unwrap();
+        assert_eq!(scroll.validated().scroll_sensitivity, default);
     }
 
     #[test]
