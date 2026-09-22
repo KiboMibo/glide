@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.15-kibo.2](https://github.com/KiboMibo/glide/compare/v0.2.15-kibo.1...v0.2.15-kibo.2) (2026-09-22)
+
+Fork release on top of 0.2.15-kibo.1. The scroll layout now follows trackpad swipes, and its animations are faster and smoother.
+
+### Improvements
+
+* Scroll layout columns with a trackpad swipe: hold Option (configurable with `scroll_modifier`) and swipe with two fingers, horizontally or vertically, to move one column ([905483d](https://github.com/KiboMibo/glide/commit/905483d))
+* Make scroll layout animations faster and smoother, and respect `animate = false` for them ([5b17e27](https://github.com/KiboMibo/glide/commit/5b17e27))
+
+### Bug Fixes
+
+* Keep scroll layout columns on their own monitor when the monitor is not at the left edge ([5b17e27](https://github.com/KiboMibo/glide/commit/5b17e27))
+
 ## [0.2.15-kibo.1](https://github.com/KiboMibo/glide/compare/v0.2.15...v0.2.15-kibo.1) (2026-09-21)
 
 Fork release on top of 0.2.15. Adds scratchpad windows: show and hide an app with one key over the current space, like yabai's scratchpad. See "Scratchpad windows" in the README.
