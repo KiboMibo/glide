@@ -205,7 +205,9 @@ Three centering modes control when the viewport scrolls to keep the focused colu
 
 After layout calculation, `apply_viewport_to_frames` offsets window positions by the scroll offset and hides off-screen windows by moving them out of view. This function is generic over the window identifier type to keep the model layer free of actor-layer dependencies.
 
-The Reactor drives animation with a timer that fires only when a scroll animation is active.
+The scroll offset is measured from the left edge of the screen, so a scroll layout on a monitor whose origin is not at x=0 stays on that monitor; `set_screen` gives the viewport the whole screen rect.
+
+The Reactor drives animation with a timer that fires only when a scroll animation is active. Each tick's frames go to the `AnimationManager` as a `ScrollFrame` message, which starts `BeginWindowAnimation` once per window and sends position-only `AnimationFrame`s; when the spring settles or the scroll is interrupted, `ScrollEnd` sends every window whose animation was begun a sized `AnimationFrame` at its last target frame, then `EndWindowAnimation`, which re-applies that frame with retries. A frame the Reactor accepts from outside Glide mid-scroll, such as a user resize of an animated window, goes to the manager as `ScrollWindowFrame` and becomes that window's last target.
 
 ### Interactive resize and move
 

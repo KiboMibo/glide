@@ -44,9 +44,58 @@ impl Reactor {
         (reactor, rx)
     }
 
+    /// Like [`Self::new_for_test_with_animation`], with an [`AnimationPump`]
+    /// that forwards animations to the app channels.
+    pub fn new_for_test_with_animation_pump(
+        config: Config,
+        layout: LayoutManager,
+    ) -> (Reactor, AnimationPump) {
+        let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(Arc::new(config), layout, record, group_indicators_tx);
+        let (tx, rx) = unbounded_channel();
+        reactor.animation_tx = Some(tx);
+        let pump = AnimationPump {
+            manager: animation::AnimationManager::new(),
+            rx,
+        };
+        (reactor, pump)
+    }
+
     pub fn handle_events(&mut self, events: Vec<Event>) {
         for event in events {
             self.handle_event(event);
+        }
+    }
+}
+
+/// Runs the animation manager synchronously in tests.
+pub struct AnimationPump {
+    manager: animation::AnimationManager,
+    rx: UnboundedReceiver<animation::Message>,
+}
+
+impl AnimationPump {
+    /// Handles every pending message, running each animation to completion.
+    pub fn pump(&mut self) {
+        while let Ok(message) = self.rx.try_recv() {
+            if self.manager.handle_message(message).is_some() {
+                while self.manager.tick().is_some() {}
+            }
+        }
+    }
+
+    /// Pumps animations and simulates the apps until neither has more to do.
+    pub fn settle(&mut self, reactor: &mut Reactor, apps: &mut Apps) {
+        loop {
+            self.pump();
+            let requests = apps.tagged_requests();
+            if requests.is_empty() && self.rx.is_empty() {
+                break;
+            }
+            for event in apps.simulate_events_for_tagged_requests(requests) {
+                reactor.handle_event(event);
+            }
         }
     }
 }
@@ -111,6 +160,9 @@ pub struct WindowState {
     pub last_seen_txid: TransactionId,
     pub animating: bool,
     pub frame: CGRect,
+    /// The last sized animation frame, which `EndWindowAnimation` applies
+    /// again, as the app thread does.
+    pub last_animation_frame: Option<CGRect>,
 }
 
 impl Apps {
@@ -292,11 +344,15 @@ impl Apps {
                     }
                 }
                 Request::AnimationFrame { wid, frame, set_size, txid } => {
-                    let window = self.windows.entry(wid).or_default();
+                    // Like the app thread, skip a window that is gone.
+                    let Some(window) = self.windows.get_mut(&wid) else {
+                        continue;
+                    };
                     window.last_seen_txid = txid;
                     let old_frame = window.frame;
                     if set_size {
                         window.frame = frame;
+                        window.last_animation_frame = Some(frame);
                     } else {
                         window.frame.origin = frame.origin;
                     }
@@ -311,11 +367,19 @@ impl Apps {
                     }
                 }
                 Request::BeginWindowAnimation(wid) => {
-                    self.windows.entry(wid).or_default().animating = true;
+                    let window = self.windows.entry(wid).or_default();
+                    window.animating = true;
+                    window.last_animation_frame = None;
                 }
                 Request::EndWindowAnimation(wid) => {
-                    let window = self.windows.entry(wid).or_default();
+                    // Like the app thread, answer nothing for a window that is gone.
+                    let Some(window) = self.windows.get_mut(&wid) else {
+                        continue;
+                    };
                     window.animating = false;
+                    if let Some(frame) = window.last_animation_frame.take() {
+                        window.frame = frame;
+                    }
                     events.push(Event::WindowFrameChanged(
                         wid,
                         window.frame,

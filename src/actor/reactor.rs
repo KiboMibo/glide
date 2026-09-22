@@ -42,6 +42,7 @@ use crate::actor::{group_bars, space_manager, status, window_server, wm_controll
 use crate::collections::{HashMap, HashSet};
 use crate::config::{Config, ScrollModifier};
 use crate::log::{self, MetricsCommand};
+use crate::model::GroupBarInfo;
 use crate::model::scratchpad::{
     FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState,
 };
@@ -317,9 +318,42 @@ pub struct Reactor {
     system: Box<dyn SystemActions>,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
+    /// Whether the last layout update was a frame of a scroll animation.
+    /// Clearing it must go with sending `ScrollEnd`: until then the windows of
+    /// the animation keep enhanced UI and frame notifications off.
+    scroll_animating: bool,
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
     group_indicators_tx: group_bars::Sender,
+    /// The groups last sent to group bars for each space. Cleared when group
+    /// bars may have dropped them. Group bars also drop them on
+    /// `SpaceDisabled`/`GlobalDisabled` from the space manager, which Reactor
+    /// does not see; the `SpaceChanged` that follows those clears this.
+    sent_groups: HashMap<SpaceId, Vec<GroupBarInfo>>,
+}
+
+fn same_groups(a: &[GroupBarInfo], b: &[GroupBarInfo]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            let GroupBarInfo {
+                node_id,
+                container_kind,
+                total_count,
+                selected_index,
+                is_visible,
+                is_selected,
+                indicator_frame,
+                is_on_top,
+            } = a;
+            *node_id == b.node_id
+                && *container_kind == b.container_kind
+                && *total_count == b.total_count
+                && *selected_index == b.selected_index
+                && *is_visible == b.is_visible
+                && *is_selected == b.is_selected
+                && *indicator_frame == b.indicator_frame
+                && *is_on_top == b.is_on_top
+        })
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -505,9 +539,11 @@ impl Reactor {
             system: Box::new(NoSystem),
             raise_manager_tx,
             animation_tx: None,
+            scroll_animating: false,
             mouse_tx: None,
             status_tx: None,
             group_indicators_tx: group_indicators_tx,
+            sent_groups: HashMap::default(),
         }
     }
 
@@ -531,26 +567,28 @@ impl Reactor {
         let mut tick_timer = Timer::manual();
 
         loop {
-            let animating = self.layout.has_active_scroll_animation();
+            let animating = self.scroll_animating;
             tokio::select! {
                 event = events.recv() => {
                     let Some((span, event)) = event else { break };
                     let _guard = span.enter();
-                    let was_animating = self.layout.has_active_scroll_animation();
                     self.handle_event(event);
-                    if !was_animating && self.layout.has_active_scroll_animation() {
+                    if !animating && self.scroll_animating {
                         tick_timer.set_next_fire(Duration::ZERO);
                     }
                 }
                 _ = tick_timer.next(), if animating => {
-                    self.layout.tick_viewports();
-                    self.update_layout(&[], true);
-                    if self.layout.has_active_scroll_animation() {
+                    self.tick_scroll_animation(Instant::now());
+                    if self.scroll_animating {
                         tick_timer.set_next_fire(tick_interval);
                     }
                 }
             }
         }
+    }
+
+    fn tick_scroll_animation(&mut self, now: Instant) {
+        self.update_layout_at(&[], true, now);
     }
 
     fn log_event(&self, event: &Event) {
@@ -716,6 +754,9 @@ impl Reactor {
                 if old_frame == new_frame {
                     return;
                 }
+                if self.scroll_animating {
+                    self.send_animation(AnimationMessage::ScrollWindowFrame(wid, new_frame));
+                }
                 self.send_layout_event(LayoutEvent::WindowFrameChanged { wid, frame: new_frame });
                 let old_screen = self.best_screen_idx_for_window(&old_frame);
                 let new_screen = self.best_screen_idx_for_window(&new_frame);
@@ -760,6 +801,8 @@ impl Reactor {
                 on_screen,
             } => {
                 info!("screen parameters changed");
+                self.layout.snap_viewports();
+                self.sent_groups.clear();
                 let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 self.screens = frames
@@ -815,6 +858,8 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 info!("space changed");
+                self.layout.snap_viewports();
+                self.sent_groups.clear();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
@@ -882,8 +927,10 @@ impl Reactor {
                 if self.layout.has_interactive_state() {
                     if let Some(&screen) = self.active_screen() {
                         if let Some(space) = screen.space {
-                            self.layout.end_interactive_resize(space, screen.frame, &self.config);
-                            self.layout.end_interactive_move(space, screen.frame, &self.config);
+                            let now = Instant::now();
+                            let config = &self.config;
+                            self.layout.end_interactive_resize(space, screen.frame, config, now);
+                            self.layout.end_interactive_move(space, screen.frame, config, now);
                         }
                     }
                 }
@@ -1029,6 +1076,10 @@ impl Reactor {
             Event::ConfigChanged(config) => {
                 self.layout.set_config(&config);
                 self.config = config;
+                self.sent_groups.clear();
+                if !self.config.settings.animate {
+                    self.layout.snap_viewports();
+                }
             }
         }
         if let Some(raised_window) = raised_window {
@@ -1038,6 +1089,8 @@ impl Reactor {
         }
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
+        } else if !self.layout.has_interactive_state() {
+            self.interrupt_scroll_animation();
         }
     }
 
@@ -1535,6 +1588,11 @@ impl Reactor {
 
     #[instrument(skip(self), fields())]
     pub fn update_layout(&mut self, new_wids: &[WindowId], skip_anim: bool) {
+        self.update_layout_at(new_wids, skip_anim, Instant::now());
+    }
+
+    fn update_layout_at(&mut self, new_wids: &[WindowId], skip_anim: bool, now: Instant) {
+        self.layout.tick_viewports(now);
         let main_window = self.main_window();
         trace!(?main_window);
         let mut anim = Animation::new();
@@ -1542,13 +1600,16 @@ impl Reactor {
         for &screen in &self.screens {
             let Some(space) = screen.space else { continue };
             if !skip_anim {
-                self.layout.update_viewport_for_focus(space, screen.frame, &self.config);
+                self.layout.update_viewport_for_focus(space, screen.frame, &self.config, now);
             }
             let (result, groups) =
-                self.layout.calculate_layout_and_groups(space, screen.frame, &self.config);
+                self.layout.calculate_layout_and_groups(space, screen.frame, &self.config, now);
 
-            self.group_indicators_tx
-                .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
+            if self.sent_groups.get(&space).is_none_or(|sent| !same_groups(sent, &groups)) {
+                self.sent_groups.insert(space, groups.clone());
+                self.group_indicators_tx
+                    .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
+            }
 
             targets
                 .extend(result.into_iter().map(|(wid, frame)| (wid, (frame, screen.scale_factor))));
@@ -1580,7 +1641,6 @@ impl Reactor {
             // Some apps move a window back after we place it, which turns into
             // an event that makes us place it again. Stop writing the frame
             // once it's clear the app won't keep it.
-            let now = Instant::now();
             let attempt = self.frame_attempts.entry(wid).or_insert(FrameAttempt {
                 target: target_frame,
                 count: 0,
@@ -1612,27 +1672,46 @@ impl Reactor {
             anim.add_window(&app.handle, wid, current_frame, target_frame, is_new, txid);
             window.frame_monotonic = target_frame;
         }
-        // If the user is doing something with the mouse we don't want to
-        // animate on top of that.
-        let skip_anim =
-            skip_anim || !self.config.settings.animate || self.layout.has_active_scroll_animation();
-        if let Some(tx) = &self.animation_tx
-            && !anim.is_empty()
-        {
-            let message = if skip_anim {
-                AnimationMessage::SkipToEnd(anim)
-            } else {
-                AnimationMessage::Replace(anim)
-            };
-            if let Err(err) = tx.send(message) {
-                error!("Animation manager exited unexpectedly");
-                match err.0 {
-                    AnimationMessage::Replace(animation) => animation.skip_to_end(),
-                    AnimationMessage::SkipToEnd(animation) => animation.skip_to_end(),
-                }
+        // Every write during a scroll animation is a frame of that animation,
+        // and the first write after it ends the animation.
+        let was_scroll_animating = self.scroll_animating;
+        self.scroll_animating = self.layout.has_active_scroll_animation(now);
+        let message = if self.scroll_animating {
+            if anim.is_empty() {
+                return;
             }
+            AnimationMessage::ScrollFrame(anim)
+        } else if was_scroll_animating {
+            AnimationMessage::ScrollEnd(anim)
+        } else if anim.is_empty() {
+            return;
+        } else if skip_anim || !self.config.settings.animate {
+            // If the user is doing something with the mouse we don't want to
+            // animate on top of that.
+            AnimationMessage::SkipToEnd(anim)
         } else {
-            anim.skip_to_end();
+            AnimationMessage::Replace(anim)
+        };
+        self.send_animation(message);
+    }
+
+    fn send_animation(&self, message: AnimationMessage) {
+        let Some(tx) = &self.animation_tx else {
+            message.into_animation().skip_to_end();
+            return;
+        };
+        if let Err(err) = tx.send(message) {
+            error!("Animation manager exited unexpectedly");
+            err.0.into_animation().skip_to_end();
+        }
+    }
+
+    /// Stops a scroll animation where it is, e.g. when the user starts
+    /// dragging a window. The next layout update places the windows.
+    fn interrupt_scroll_animation(&mut self) {
+        self.layout.snap_viewports();
+        if mem::take(&mut self.scroll_animating) {
+            self.send_animation(AnimationMessage::ScrollEnd(Animation::new()));
         }
     }
 }
@@ -6389,8 +6468,1003 @@ pub mod tests {
         apps.simulate_until_quiet(&mut reactor);
 
         assert!(
-            !reactor.layout.has_active_scroll_animation(),
+            !reactor.layout.has_active_scroll_animation(Instant::now()),
             "timer should be dormant when no scroll animation is active"
         );
+    }
+
+    mod scroll_animation {
+        use test_log::test;
+
+        use super::*;
+        use crate::actor::layout::LayoutCommand::MoveFocus;
+        use crate::config::Config;
+        use crate::model::Direction::Right;
+        use crate::model::LayoutKind;
+
+        const TICK: Duration = Duration::from_millis(8);
+
+        fn space() -> SpaceId {
+            SpaceId::new(1)
+        }
+
+        fn screen() -> CGRect {
+            CGRect::new(CGPoint::new(0., 0.), CGSize::new(900., 900.))
+        }
+
+        fn config(animate: bool) -> Config {
+            let mut config = Config::default();
+            config.settings.default_disable = false;
+            config.settings.animate = animate;
+            config.settings.default_layout_kind = LayoutKind::Scroll;
+            config.settings.experimental.scroll.enable = true;
+            config
+        }
+
+        fn w(idx: u32) -> WindowId {
+            WindowId::new(1, idx)
+        }
+
+        /// The frame requests an app received.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Sent {
+            Begin(WindowId),
+            Frame(WindowId, CGRect, bool),
+            SetFrame(WindowId, CGRect),
+            End(WindowId),
+            Other,
+        }
+
+        impl Sent {
+            fn wid(self) -> Option<WindowId> {
+                match self {
+                    Sent::Begin(wid)
+                    | Sent::Frame(wid, ..)
+                    | Sent::SetFrame(wid, _)
+                    | Sent::End(wid) => Some(wid),
+                    Sent::Other => None,
+                }
+            }
+        }
+
+        /// Takes the requests sent to apps and applies them in the harness.
+        fn take_requests(reactor: &mut Reactor, apps: &mut Apps) -> Vec<Sent> {
+            let requests = apps.tagged_requests();
+            let sent = requests
+                .iter()
+                .map(|(_, request)| match *request {
+                    Request::BeginWindowAnimation(wid) => Sent::Begin(wid),
+                    Request::AnimationFrame { wid, frame, set_size, .. } => {
+                        Sent::Frame(wid, frame, set_size)
+                    }
+                    Request::SetWindowFrame(wid, frame, _) => Sent::SetFrame(wid, frame),
+                    Request::EndWindowAnimation(wid) => Sent::End(wid),
+                    _ => Sent::Other,
+                })
+                .collect();
+            for event in apps.simulate_events_for_tagged_requests(requests) {
+                reactor.handle_event(event);
+            }
+            sent
+        }
+
+        /// Four columns, two of them visible, with the second one focused.
+        fn setup(animate: bool) -> (Reactor, Apps, AnimationPump) {
+            setup_with_windows(animate, 4)
+        }
+
+        fn setup_with_windows(animate: bool, windows: u32) -> (Reactor, Apps, AnimationPump) {
+            let (mut reactor, mut pump) = Reactor::new_for_test_with_animation_pump(
+                config(animate),
+                LayoutManager::new_for_test(),
+            );
+            reactor.handle_event(Event::ScreenParametersChanged {
+                frames: vec![screen()],
+                spaces: vec![Some(space())],
+                scale_factors: vec![2.0],
+                converter: CoordinateConverter::default(),
+                on_screen: Default::default(),
+            });
+            let mut apps = Apps::new();
+            reactor.handle_event(Event::ApplicationGloballyActivated(1));
+            reactor.handle_events(apps.make_app_with_opts(
+                1,
+                make_windows(windows as usize),
+                Some(w(1)),
+                true,
+            ));
+            reactor.handle_event(Event::StartupComplete);
+            pump.settle(&mut reactor, &mut apps);
+            reactor.handle_event(Event::Command(Command::Layout(MoveFocus(Right))));
+            pump.settle(&mut reactor, &mut apps);
+            assert!(!reactor.scroll_animating, "the second column is already visible");
+            (reactor, apps, pump)
+        }
+
+        /// Focuses the third column, which scrolls the viewport by one column.
+        fn start_scroll(
+            reactor: &mut Reactor,
+            apps: &mut Apps,
+            pump: &mut AnimationPump,
+        ) -> Vec<Sent> {
+            reactor.handle_event(Event::Command(Command::Layout(MoveFocus(Right))));
+            assert!(reactor.scroll_animating);
+            pump.pump();
+            take_requests(reactor, apps)
+        }
+
+        fn tick(
+            reactor: &mut Reactor,
+            apps: &mut Apps,
+            pump: &mut AnimationPump,
+            now: Instant,
+        ) -> Vec<Sent> {
+            reactor.tick_scroll_animation(now);
+            pump.pump();
+            take_requests(reactor, apps)
+        }
+
+        /// Ticks the scroll animation until it ends, returning the requests of
+        /// each tick.
+        fn run_ticks(
+            reactor: &mut Reactor,
+            apps: &mut Apps,
+            pump: &mut AnimationPump,
+        ) -> Vec<Vec<Sent>> {
+            let start = Instant::now();
+            let mut ticks = vec![];
+            for i in 1..=1000 {
+                ticks.push(tick(reactor, apps, pump, start + TICK * i));
+                if !reactor.scroll_animating {
+                    return ticks;
+                }
+            }
+            panic!("scroll animation did not end");
+        }
+
+        fn count(sent: &[Sent], pred: impl Fn(Sent) -> bool) -> BTreeMap<WindowId, usize> {
+            let mut counts = BTreeMap::new();
+            for s in sent.iter().copied().filter(|&s| pred(s)) {
+                *counts.entry(s.wid().unwrap()).or_default() += 1;
+            }
+            counts
+        }
+
+        fn begins(sent: &[Sent]) -> BTreeMap<WindowId, usize> {
+            count(sent, |s| matches!(s, Sent::Begin(_)))
+        }
+
+        fn ends(sent: &[Sent]) -> BTreeMap<WindowId, usize> {
+            count(sent, |s| matches!(s, Sent::End(_)))
+        }
+
+        fn assert_windows_at_final_frames(reactor: &Reactor, apps: &Apps) {
+            for (wid, frame) in reactor.layout.calculate_layout(space(), screen(), &reactor.config)
+            {
+                let window = &apps.windows[&wid];
+                assert!(
+                    window.frame.same_as(frame),
+                    "{wid:?}: {:?} != {frame:?}",
+                    window.frame
+                );
+                assert!(!window.animating, "{wid:?}");
+            }
+        }
+
+        #[test]
+        fn scroll_ticks_send_position_frames_and_end_the_animation() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+            let (last, intermediate) = ticks.split_last().unwrap();
+            assert!(intermediate.len() > 2, "expected several frames: {ticks:?}");
+
+            for &sent in intermediate.iter().flatten() {
+                assert!(
+                    matches!(sent, Sent::Begin(_) | Sent::Frame(_, _, false)),
+                    "unexpected request on an intermediate tick: {sent:?}"
+                );
+            }
+            for &sent in last {
+                assert!(
+                    matches!(sent, Sent::Frame(_, _, true) | Sent::End(_)),
+                    "unexpected request on the last tick: {sent:?}"
+                );
+            }
+
+            let all = ticks.concat();
+            let begun = begins(&all);
+            assert_eq!(begun.keys().copied().collect_vec(), vec![w(1), w(2), w(3)]);
+            assert!(begun.values().all(|&n| n == 1), "{begun:?}");
+            assert_eq!(ends(&all), begun);
+            assert!(
+                all.iter().all(|s| s.wid() != Some(w(4))),
+                "the window parked right of the screen must not get frames"
+            );
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn window_gets_no_frames_once_it_is_parked() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut all = start_scroll(&mut reactor, &mut apps, &mut pump);
+            all.extend(run_ticks(&mut reactor, &mut apps, &mut pump).concat());
+            let parked_x = screen().origin.x - apps.windows[&w(1)].frame.size.width;
+            let frames_of_w1: Vec<CGRect> = all
+                .iter()
+                .filter_map(|&s| match s {
+                    Sent::Frame(wid, frame, _) if wid == w(1) => Some(frame),
+                    _ => None,
+                })
+                .collect();
+            let parked = frames_of_w1.iter().position(|f| f.origin.x == parked_x);
+            assert_eq!(parked, Some(frames_of_w1.len() - 1), "{frames_of_w1:?}");
+        }
+
+        #[test]
+        fn drag_interrupts_scroll_animation() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            let start = Instant::now();
+            sent.extend(tick(&mut reactor, &mut apps, &mut pump, start + TICK));
+            sent.extend(tick(&mut reactor, &mut apps, &mut pump, start + TICK * 2));
+            let begun = begins(&sent);
+            assert!(!begun.is_empty());
+
+            let window = &reactor.windows[&w(2)];
+            let mut dragged = window.frame_monotonic;
+            dragged.origin.y += 10.0;
+            reactor.handle_event(Event::WindowFrameChanged(
+                w(2),
+                dragged,
+                window.last_sent_txid,
+                Requested(false),
+                Some(MouseState::Down),
+            ));
+            pump.pump();
+            let after = take_requests(&mut reactor, &mut apps);
+            assert!(
+                after.iter().all(|s| matches!(s, Sent::Frame(_, _, true) | Sent::End(_))),
+                "{after:?}"
+            );
+            assert_eq!(ends(&after), begun);
+            assert!(!reactor.scroll_animating);
+            assert!(!reactor.layout.has_active_scroll_animation(Instant::now()));
+        }
+
+        /// Interrupts a running scroll animation, returning the requests sent.
+        fn interrupt_scroll(interrupt: impl FnOnce(&mut Reactor)) -> (Reactor, Apps, Vec<Sent>) {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(tick(&mut reactor, &mut apps, &mut pump, Instant::now() + TICK));
+            let begun = begins(&sent);
+            assert!(!begun.is_empty());
+
+            interrupt(&mut reactor);
+            pump.pump();
+            let after = take_requests(&mut reactor, &mut apps);
+            assert!(!reactor.scroll_animating);
+            assert!(!reactor.layout.has_active_scroll_animation(Instant::now()));
+            assert!(begins(&after).is_empty(), "{after:?}");
+            assert_eq!(ends(&after), begun);
+            assert!(
+                after.iter().all(|s| !matches!(s, Sent::Frame(_, _, false))),
+                "{after:?}"
+            );
+            pump.settle(&mut reactor, &mut apps);
+            (reactor, apps, after)
+        }
+
+        #[test]
+        fn disabling_animate_ends_scroll_animation_at_the_target() {
+            let (reactor, apps, _) = interrupt_scroll(|reactor| {
+                reactor.handle_event(Event::ConfigChanged(Arc::new(config(false))));
+            });
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn screen_change_ends_scroll_animation_at_the_target() {
+            let (reactor, apps, _) = interrupt_scroll(|reactor| {
+                reactor.handle_event(Event::ScreenParametersChanged {
+                    frames: vec![screen()],
+                    spaces: vec![Some(space())],
+                    scale_factors: vec![2.0],
+                    converter: CoordinateConverter::default(),
+                    on_screen: Default::default(),
+                });
+            });
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn space_change_ends_scroll_animation() {
+            let (_, _, after) = interrupt_scroll(|reactor| {
+                reactor.handle_event(Event::SpaceChanged(
+                    vec![Some(SpaceId::new(2))],
+                    Default::default(),
+                ));
+            });
+            assert!(
+                after
+                    .iter()
+                    .all(|s| matches!(s, Sent::Frame(_, _, true) | Sent::End(_) | Sent::Other)),
+                "{after:?}"
+            );
+        }
+
+        #[test]
+        fn destroyed_window_still_gets_its_animation_ended() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut all = start_scroll(&mut reactor, &mut apps, &mut pump);
+            all.extend(tick(&mut reactor, &mut apps, &mut pump, Instant::now() + TICK));
+            assert_eq!(begins(&all).get(&w(3)), Some(&1));
+
+            reactor.handle_event(Event::WindowDestroyed(w(3)));
+            apps.windows.remove(&w(3));
+            pump.pump();
+            all.extend(take_requests(&mut reactor, &mut apps));
+            all.extend(run_ticks(&mut reactor, &mut apps, &mut pump).concat());
+            assert_eq!(ends(&all), begins(&all));
+            assert!(!all.iter().any(|s| matches!(s, Sent::SetFrame(..))), "{all:?}");
+        }
+
+        #[test]
+        fn animate_false_jumps_to_the_target() {
+            let (mut reactor, mut apps, mut pump) = setup(false);
+            reactor.handle_event(Event::Command(Command::Layout(MoveFocus(Right))));
+            assert!(!reactor.scroll_animating);
+            assert!(!reactor.layout.has_active_scroll_animation(Instant::now()));
+            pump.pump();
+            let sent = take_requests(&mut reactor, &mut apps);
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|s| matches!(s, Sent::SetFrame(..))), "{sent:?}");
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn groups_are_sent_only_when_they_change() {
+            let (mut reactor, mut apps, mut pump) = setup(false);
+            let (tx, mut rx) = crate::actor::channel();
+            reactor.group_indicators_tx = tx;
+            reactor.handle_event(Event::MouseUp);
+            pump.settle(&mut reactor, &mut apps);
+            assert!(rx.try_recv().is_err(), "unchanged groups were sent again");
+
+            reactor.handle_event(Event::SpaceChanged(vec![Some(space())], Default::default()));
+            pump.settle(&mut reactor, &mut apps);
+            assert!(matches!(
+                rx.try_recv().map(|(_, e)| e),
+                Ok(group_bars::Event::GroupsUpdated { .. })
+            ));
+        }
+
+        /// Checks that every window's Begin and End alternate, starting with a
+        /// Begin, and that no animation is left open.
+        fn assert_begin_end_balanced(sent: &[Sent]) {
+            let mut open = BTreeMap::<WindowId, bool>::new();
+            for &s in sent {
+                match s {
+                    Sent::Begin(wid) => {
+                        let was_open = open.insert(wid, true).unwrap_or(false);
+                        assert!(!was_open, "{wid:?} begun twice: {sent:?}");
+                    }
+                    Sent::End(wid) => {
+                        let was_open = open.insert(wid, false).unwrap_or(false);
+                        assert!(was_open, "{wid:?} ended without a begin: {sent:?}");
+                    }
+                    _ => {}
+                }
+            }
+            let still_open = open.iter().filter(|(_, o)| **o).map(|(w, _)| *w).collect_vec();
+            assert!(still_open.is_empty(), "never ended: {still_open:?}");
+        }
+
+        /// Checks that no tick but the last one writes a full frame.
+        fn assert_no_full_frame_before_last(ticks: &[Vec<Sent>]) {
+            let (_, intermediate) = ticks.split_last().unwrap();
+            for &sent in intermediate.iter().flatten() {
+                assert!(
+                    !matches!(sent, Sent::SetFrame(..) | Sent::Frame(_, _, true)),
+                    "full frame write on an intermediate tick: {sent:?}"
+                );
+            }
+        }
+
+        fn ticks_from(
+            reactor: &mut Reactor,
+            apps: &mut Apps,
+            pump: &mut AnimationPump,
+            start: Instant,
+            range: std::ops::RangeInclusive<u32>,
+        ) -> Vec<Vec<Sent>> {
+            range.map(|i| tick(reactor, apps, pump, start + TICK * i)).collect()
+        }
+
+        fn command(reactor: &mut Reactor, direction: Direction) {
+            reactor.handle_event(Event::Command(Command::Layout(MoveFocus(direction))));
+        }
+
+        #[test]
+        fn second_move_mid_scroll_retargets_without_restarting_windows() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=3));
+            command(&mut reactor, Right);
+            assert!(reactor.scroll_animating);
+            pump.pump();
+            ticks.push(take_requests(&mut reactor, &mut apps));
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+
+            assert_no_full_frame_before_last(&ticks);
+            let all = ticks.concat();
+            assert!(begins(&all).values().all(|&n| n == 1), "{:?}", begins(&all));
+            assert_begin_end_balanced(&all);
+            assert_windows_at_final_frames(&reactor, &apps);
+            let focused = reactor
+                .layout
+                .calculate_layout(space(), screen(), &reactor.config)
+                .into_iter()
+                .find(|(wid, _)| *wid == w(4))
+                .unwrap()
+                .1;
+            assert!(focused.origin.x >= 0.0 && focused.max().x <= screen().max().x);
+        }
+
+        #[test]
+        fn reversing_mid_scroll_ends_every_window_once() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=3));
+            command(&mut reactor, Direction::Left);
+            command(&mut reactor, Direction::Left);
+            pump.pump();
+            ticks.push(take_requests(&mut reactor, &mut apps));
+            if reactor.scroll_animating {
+                ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+            }
+
+            assert_no_full_frame_before_last(&ticks);
+            assert_begin_end_balanced(&ticks.concat());
+            pump.settle(&mut reactor, &mut apps);
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn window_appearing_mid_scroll_joins_the_animation() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2));
+
+            let info = make_window(5);
+            apps.windows.insert(
+                w(5),
+                super::testing::WindowState {
+                    frame: info.frame,
+                    ..Default::default()
+                },
+            );
+            reactor.handle_event(Event::WindowCreated(w(5), info, MouseState::Up));
+            let on_screen = make_windows(5)
+                .iter()
+                .map(|info| WindowServerInfo {
+                    pid: 1,
+                    id: info.sys_id.unwrap(),
+                    layer: 0,
+                    frame: info.frame,
+                })
+                .collect();
+            reactor.handle_event(Event::WindowsOnScreenUpdated {
+                pid: Some(1),
+                on_screen: WindowsOnScreen::new(on_screen),
+            });
+            reactor.handle_event(Event::WindowBecameVisible(w(5)));
+            assert!(reactor.scroll_animating);
+            pump.pump();
+            ticks.push(take_requests(&mut reactor, &mut apps));
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+
+            // The new window is resized once, from its own size to the column's.
+            let (_, intermediate) = ticks.split_last().unwrap();
+            let sized = intermediate
+                .iter()
+                .flatten()
+                .filter(|s| matches!(s, Sent::SetFrame(..) | Sent::Frame(_, _, true)))
+                .collect_vec();
+            assert!(
+                matches!(sized[..], [Sent::Frame(wid, _, true)] if *wid == w(5)),
+                "{sized:?}"
+            );
+            let all = ticks.concat();
+            assert_begin_end_balanced(&all);
+            pump.settle(&mut reactor, &mut apps);
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn window_resized_by_the_user_mid_scroll_still_gets_its_end() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2));
+            assert_eq!(begins(&ticks.concat()).get(&w(2)), Some(&1));
+
+            let window = &reactor.windows[&w(2)];
+            let mut resized = window.frame_monotonic;
+            resized.size.width -= 20.0;
+            reactor.handle_event(Event::WindowFrameChanged(
+                w(2),
+                resized,
+                window.last_sent_txid,
+                Requested(false),
+                Some(MouseState::Down),
+            ));
+            assert_eq!(reactor.resizing_window, Some(w(2)));
+            pump.pump();
+            ticks.push(take_requests(&mut reactor, &mut apps));
+            let later = ticks_from(&mut reactor, &mut apps, &mut pump, start, 3..=5);
+            assert!(
+                later
+                    .iter()
+                    .flatten()
+                    .all(|s| !matches!(s, Sent::Frame(wid, ..) if *wid == w(2))),
+                "frames were written to the window being resized: {later:?}"
+            );
+            ticks.extend(later);
+            if reactor.scroll_animating {
+                ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+            }
+            assert_no_full_frame_before_last(&ticks);
+            assert_begin_end_balanced(&ticks.concat());
+        }
+
+        #[test]
+        fn enabling_animate_on_the_fly_animates_the_next_scroll() {
+            let (mut reactor, mut apps, mut pump) = setup(false);
+            reactor.handle_event(Event::ConfigChanged(Arc::new(config(true))));
+            pump.settle(&mut reactor, &mut apps);
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+            assert!(ticks.len() > 3, "{ticks:?}");
+            assert_no_full_frame_before_last(&ticks);
+            assert_begin_end_balanced(&ticks.concat());
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn animate_false_never_starts_an_animation() {
+            let (mut reactor, mut apps, mut pump) = setup(false);
+            for direction in [Right, Right, Direction::Left, Direction::Left, Right] {
+                command(&mut reactor, direction);
+                assert!(!reactor.scroll_animating);
+                assert!(!reactor.layout.has_active_scroll_animation(Instant::now()));
+                pump.pump();
+                let sent = take_requests(&mut reactor, &mut apps);
+                assert!(
+                    sent.iter().all(|s| matches!(s, Sent::SetFrame(..) | Sent::Other)),
+                    "{direction:?}: {sent:?}"
+                );
+                pump.settle(&mut reactor, &mut apps);
+                assert_windows_at_final_frames(&reactor, &apps);
+            }
+        }
+
+        #[test]
+        fn scroll_ticks_do_not_resend_unchanged_groups() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let (tx, mut rx) = crate::actor::channel();
+            reactor.group_indicators_tx = tx;
+            start_scroll(&mut reactor, &mut apps, &mut pump);
+            run_ticks(&mut reactor, &mut apps, &mut pump);
+            pump.settle(&mut reactor, &mut apps);
+            assert!(rx.try_recv().is_err(), "groups without changes were sent");
+        }
+
+        #[test]
+        fn group_cache_is_cleared_by_screen_and_config_changes() {
+            let (mut reactor, mut apps, mut pump) = setup(false);
+            let (tx, mut rx) = crate::actor::channel();
+            reactor.group_indicators_tx = tx;
+            let events = [
+                (
+                    "ScreenParametersChanged",
+                    Event::ScreenParametersChanged {
+                        frames: vec![screen()],
+                        spaces: vec![Some(space())],
+                        scale_factors: vec![2.0],
+                        converter: CoordinateConverter::default(),
+                        on_screen: Default::default(),
+                    },
+                ),
+                ("ConfigChanged", Event::ConfigChanged(Arc::new(config(false)))),
+            ];
+            for (name, event) in events {
+                reactor.handle_event(event);
+                pump.settle(&mut reactor, &mut apps);
+                let groups_sent = |rx: &mut crate::actor::Receiver<group_bars::Event>| {
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .filter(|(_, e)| matches!(e, group_bars::Event::GroupsUpdated { .. }))
+                        .count()
+                };
+                assert_eq!(groups_sent(&mut rx), 1, "groups were not resent after {name}");
+                reactor.handle_event(Event::MouseUp);
+                pump.settle(&mut reactor, &mut apps);
+                assert_eq!(groups_sent(&mut rx), 0, "groups resent twice after {name}");
+            }
+        }
+
+        /// Checks that each window stands where the reactor last put it, with
+        /// its animation ended.
+        fn assert_windows_where_the_reactor_put_them(reactor: &Reactor, apps: &Apps) {
+            for (wid, window) in &reactor.windows {
+                let Some(app_window) = apps.windows.get(wid) else {
+                    continue;
+                };
+                assert!(
+                    app_window.frame.same_as(window.frame_monotonic),
+                    "{wid:?} is at {:?}, the reactor put it at {:?}",
+                    app_window.frame,
+                    window.frame_monotonic
+                );
+                assert!(!app_window.animating, "{wid:?}");
+            }
+        }
+
+        fn cycle_column_width(reactor: &mut Reactor) {
+            reactor.handle_event(Event::Command(Command::Layout(
+                crate::actor::layout::LayoutCommand::CycleColumnWidth,
+            )));
+        }
+
+        /// Starts a scroll and resizes the focused column after two ticks, so
+        /// the focused window gets a sized frame mid-scroll and position-only
+        /// frames after it.
+        fn scroll_with_a_resize_mid_way(
+            reactor: &mut Reactor,
+            apps: &mut Apps,
+            pump: &mut AnimationPump,
+        ) -> Vec<Vec<Sent>> {
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(reactor, apps, pump)];
+            ticks.extend(ticks_from(reactor, apps, pump, start, 1..=2));
+            cycle_column_width(reactor);
+            pump.pump();
+            ticks.push(take_requests(reactor, apps));
+            ticks.extend(ticks_from(reactor, apps, pump, start, 3..=4));
+            let sized_then_moved = ticks
+                .concat()
+                .iter()
+                .any(|s| matches!(s, Sent::Frame(wid, _, true) if *wid == w(3)));
+            assert!(sized_then_moved, "{ticks:?}");
+            ticks
+        }
+
+        #[test]
+        fn window_sized_mid_scroll_stays_put_when_the_scroll_is_interrupted() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut sent =
+                scroll_with_a_resize_mid_way(&mut reactor, &mut apps, &mut pump).concat();
+            reactor.interrupt_scroll_animation();
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+            assert!(!reactor.scroll_animating);
+            assert_begin_end_balanced(&sent);
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+        }
+
+        #[test]
+        fn window_parked_before_the_end_stays_parked() {
+            let (mut reactor, mut apps, mut pump) = setup_with_windows(true, 6);
+            let mut ticks = scroll_with_a_resize_mid_way(&mut reactor, &mut apps, &mut pump);
+            // On to the last column: the resized window leaves the screen.
+            for _ in 0..3 {
+                command(&mut reactor, Right);
+            }
+            pump.pump();
+            ticks.push(take_requests(&mut reactor, &mut apps));
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+
+            let last_move_of_w3 = ticks
+                .iter()
+                .rposition(|tick| {
+                    tick.iter().any(|s| matches!(s, Sent::Frame(wid, _, false) if *wid == w(3)))
+                })
+                .unwrap();
+            assert!(
+                last_move_of_w3 < ticks.len() - 2,
+                "w3 must park before the last tick"
+            );
+            assert_begin_end_balanced(&ticks.concat());
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+            let parked = apps.windows[&w(3)].frame;
+            assert_eq!(parked.max().x, screen().min().x, "{parked:?}");
+        }
+
+        #[test]
+        fn event_after_the_spring_settles_ends_the_scroll_at_the_target() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            let start = Instant::now();
+            sent.extend(tick(&mut reactor, &mut apps, &mut pump, start + TICK));
+            let settled = (1..2000)
+                .map(|i| start + Duration::from_millis(i))
+                .find(|&t| !reactor.layout.has_active_scroll_animation(t))
+                .unwrap();
+
+            // An event, not a tick, is the first update after the spring settles.
+            reactor.update_layout_at(&[], false, settled);
+            assert!(!reactor.scroll_animating);
+            assert!(!reactor.layout.has_active_scroll_animation(start));
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+            assert_begin_end_balanced(&sent);
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        /// First time at or after `from`, in 1 ms steps, when the scroll
+        /// spring has settled.
+        fn settle_time(reactor: &Reactor, from: Instant) -> Instant {
+            (0..5000)
+                .map(|i| from + Duration::from_millis(i))
+                .find(|&t| !reactor.layout.has_active_scroll_animation(t))
+                .expect("the scroll spring settles within 5 s")
+        }
+
+        #[test]
+        fn window_destroyed_right_before_the_end_is_not_brought_back() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=3).concat());
+            assert_eq!(begins(&sent).get(&w(3)), Some(&1));
+
+            reactor.handle_event(Event::WindowDestroyed(w(3)));
+            apps.windows.remove(&w(3));
+            let settled = settle_time(&reactor, start);
+            sent.extend(tick(&mut reactor, &mut apps, &mut pump, settled));
+            assert!(!reactor.scroll_animating);
+
+            assert!(
+                !apps.windows.contains_key(&w(3)),
+                "the destroyed window came back"
+            );
+            assert_begin_end_balanced(&sent);
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn window_destroyed_before_an_interruption_is_not_brought_back() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2).concat());
+            assert_eq!(begins(&sent).get(&w(3)), Some(&1));
+
+            reactor.handle_event(Event::WindowDestroyed(w(3)));
+            apps.windows.remove(&w(3));
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+            reactor.interrupt_scroll_animation();
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+
+            assert!(
+                !apps.windows.contains_key(&w(3)),
+                "the destroyed window came back"
+            );
+            assert_begin_end_balanced(&sent);
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+        }
+
+        #[test]
+        fn column_resized_on_the_update_that_ends_the_scroll_ends_at_the_new_size() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=3).concat());
+            let before = apps.windows[&w(3)].frame;
+
+            // The focused column is resized in the layout, and the tick on which
+            // the spring settles is the first update to see it.
+            let settled = settle_time(&reactor, start);
+            _ = reactor.layout.handle_command(
+                Some(space()),
+                &[space()],
+                crate::actor::layout::LayoutCommand::CycleColumnWidth,
+            );
+            reactor.tick_scroll_animation(settled);
+            assert!(!reactor.scroll_animating);
+            pump.pump();
+            let last = take_requests(&mut reactor, &mut apps);
+            assert!(
+                last.iter().all(|s| matches!(
+                    s,
+                    Sent::Frame(_, _, true) | Sent::End(_) | Sent::SetFrame(..)
+                )),
+                "{last:?}"
+            );
+            sent.extend(last);
+
+            let after = apps.windows[&w(3)].frame;
+            assert_ne!(after.size, before.size, "the column was not resized");
+            assert_begin_end_balanced(&sent);
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn user_resize_after_the_scroll_is_not_dropped_as_stale() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(run_ticks(&mut reactor, &mut apps, &mut pump));
+            let moved_last = ticks.last().unwrap().iter().filter_map(|s| s.wid()).collect_vec();
+            assert!(!moved_last.is_empty());
+            for (wid, window) in &reactor.windows {
+                let Some(app_window) = apps.windows.get(wid) else {
+                    continue;
+                };
+                assert_eq!(app_window.last_seen_txid, window.last_sent_txid, "{wid:?}");
+            }
+
+            let wid = w(3);
+            assert!(moved_last.contains(&wid), "{moved_last:?}");
+            let mut resized = apps.windows[&wid].frame;
+            resized.size.width -= 20.0;
+            reactor.handle_event(Event::WindowFrameChanged(
+                wid,
+                resized,
+                apps.windows[&wid].last_seen_txid,
+                Requested(false),
+                None,
+            ));
+            let now = reactor.windows[&wid].frame_monotonic;
+            assert_eq!(now.size, resized.size, "the resize of {wid:?} was dropped");
+        }
+
+        /// The reactor learns of a user resize of a window after its scroll
+        /// animation has begun. The real app thread stops frame notifications
+        /// for animated windows, so this takes a notification already in
+        /// flight when the animation begins.
+        #[test]
+        fn window_resized_by_the_user_mid_scroll_keeps_the_user_frame_at_the_end() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut ticks = vec![start_scroll(&mut reactor, &mut apps, &mut pump)];
+            ticks.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2));
+            assert_eq!(begins(&ticks.concat()).get(&w(2)), Some(&1));
+
+            let window = &reactor.windows[&w(2)];
+            let mut resized = window.frame_monotonic;
+            resized.size.width -= 20.0;
+            apps.windows.get_mut(&w(2)).unwrap().frame = resized;
+            reactor.handle_event(Event::WindowFrameChanged(
+                w(2),
+                resized,
+                window.last_sent_txid,
+                Requested(false),
+                Some(MouseState::Down),
+            ));
+            pump.pump();
+            take_requests(&mut reactor, &mut apps);
+            run_ticks(&mut reactor, &mut apps, &mut pump);
+
+            let app_frame = apps.windows[&w(2)].frame;
+            assert!(
+                app_frame.same_as(resized),
+                "the user resized w2 to {resized:?}, it ended at {app_frame:?}"
+            );
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+        }
+
+        #[test]
+        fn interrupting_twice_ends_the_scroll_once() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2).concat());
+            reactor.interrupt_scroll_animation();
+            reactor.interrupt_scroll_animation();
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+            assert_begin_end_balanced(&sent);
+            assert!(begins(&sent).values().all(|&n| n == 1), "{sent:?}");
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+        }
+
+        #[test]
+        fn interrupting_after_the_scroll_ended_sends_nothing() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            start_scroll(&mut reactor, &mut apps, &mut pump);
+            run_ticks(&mut reactor, &mut apps, &mut pump);
+            assert!(!reactor.scroll_animating);
+            reactor.interrupt_scroll_animation();
+            pump.pump();
+            let after = take_requests(&mut reactor, &mut apps);
+            assert!(after.is_empty(), "{after:?}");
+            assert_windows_at_final_frames(&reactor, &apps);
+        }
+
+        #[test]
+        fn dragging_another_window_leaves_animated_windows_at_their_frames_at_that_moment() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            let start = Instant::now();
+            let mut sent = start_scroll(&mut reactor, &mut apps, &mut pump);
+            sent.extend(ticks_from(&mut reactor, &mut apps, &mut pump, start, 1..=2).concat());
+            let begun = begins(&sent);
+            assert!(!begun.contains_key(&w(4)), "w4 must not be animated: {begun:?}");
+            let at_interruption: BTreeMap<WindowId, CGRect> =
+                begun.keys().map(|&wid| (wid, reactor.windows[&wid].frame_monotonic)).collect();
+            // Mid-scroll, the animated windows are not at their final frames.
+            let finals: BTreeMap<WindowId, CGRect> = reactor
+                .layout
+                .calculate_layout(space(), screen(), &reactor.config)
+                .into_iter()
+                .collect();
+            assert!(
+                at_interruption.iter().any(|(wid, f)| !f.same_as(finals[wid])),
+                "the scroll had already reached its target"
+            );
+
+            let window = &reactor.windows[&w(4)];
+            let mut dragged = window.frame_monotonic;
+            dragged.origin.y += 10.0;
+            apps.windows.get_mut(&w(4)).unwrap().frame = dragged;
+            reactor.handle_event(Event::WindowFrameChanged(
+                w(4),
+                dragged,
+                window.last_sent_txid,
+                Requested(false),
+                Some(MouseState::Down),
+            ));
+            assert!(!reactor.scroll_animating);
+            pump.pump();
+            sent.extend(take_requests(&mut reactor, &mut apps));
+
+            assert_begin_end_balanced(&sent);
+            for (wid, frame) in &at_interruption {
+                let window = &apps.windows[wid];
+                assert!(
+                    window.frame.same_as(*frame),
+                    "{wid:?} ended at {:?}, the target at the interruption was {frame:?}",
+                    window.frame
+                );
+                assert!(!window.animating, "{wid:?}");
+            }
+            assert_windows_where_the_reactor_put_them(&reactor, &apps);
+        }
+
+        #[test]
+        #[ignore = "known defect: scroll ticks are not recorded, so a replay assigns \
+                    fewer transaction ids and drops later user resizes as stale"]
+        fn trace_with_a_scroll_animation_replays_to_the_same_layout() {
+            let (mut reactor, mut apps, mut pump) = setup(true);
+            start_scroll(&mut reactor, &mut apps, &mut pump);
+            run_ticks(&mut reactor, &mut apps, &mut pump);
+            pump.settle(&mut reactor, &mut apps);
+
+            // The user makes the focused column narrower.
+            let window = &reactor.windows[&w(3)];
+            let mut resized = window.frame_monotonic;
+            resized.size.width -= 100.0;
+            reactor.handle_event(Event::WindowFrameChanged(
+                w(3),
+                resized,
+                window.last_sent_txid,
+                Requested(false),
+                Some(MouseState::Up),
+            ));
+            pump.settle(&mut reactor, &mut apps);
+            let expected = reactor.layout.calculate_layout(space(), screen(), &reactor.config);
+
+            let trace = replay::tests::recorded_trace(&mut reactor);
+            let mut replayed = replay::tests::replay_trace(&trace);
+            replayed.layout.snap_viewports();
+            let actual = replayed.layout.calculate_layout(space(), screen(), &replayed.config);
+            assert_eq!(actual, expected, "the replay ended with a different layout");
+        }
     }
 }

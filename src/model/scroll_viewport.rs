@@ -90,11 +90,15 @@ impl ScrollState {
     }
 }
 
+/// Horizontal viewport over the columns of a scroll layout. The scroll offset
+/// is measured from the screen's left edge; frames passed in and returned are
+/// in global coordinates.
 #[derive(Debug, Clone)]
 pub struct ViewportState {
     pub scroll: ScrollState,
     pub active_column_index: usize,
     pub screen_width: f64,
+    screen_origin_x: f64,
     pub user_scrolling: bool,
     pub scroll_progress: f64,
     pub swipe: SwipeGesture,
@@ -106,6 +110,7 @@ impl ViewportState {
             scroll: ScrollState::Static(0.0),
             active_column_index: 0,
             screen_width,
+            screen_origin_x: 0.0,
             user_scrolling: false,
             scroll_progress: 0.0,
             swipe: SwipeGesture::default(),
@@ -120,8 +125,15 @@ impl ViewportState {
         self.scroll.target()
     }
 
-    pub fn set_screen_width(&mut self, width: f64) {
-        self.screen_width = width;
+    pub fn set_screen(&mut self, screen: CGRect) {
+        self.screen_origin_x = screen.origin.x;
+        self.screen_width = screen.size.width;
+    }
+
+    /// Left and right edges of the visible area in global coordinates.
+    fn view_bounds(&self, now: Instant) -> (f64, f64) {
+        let left = self.screen_origin_x + self.scroll_offset(now);
+        (left, left + self.screen_width)
     }
 
     pub fn ensure_column_visible(
@@ -135,6 +147,7 @@ impl ViewportState {
     ) {
         self.active_column_index = column_index;
         self.user_scrolling = false;
+        let column_x = column_x - self.screen_origin_x;
         let current = self.target_offset();
 
         let new_offset = match center_mode {
@@ -149,7 +162,7 @@ impl ViewportState {
             CenterMode::Never => self.compute_edge_fit(column_x, column_width, current, gap),
         };
 
-        if (new_offset - current).abs() > 0.5 {
+        if new_offset.is_finite() && (new_offset - current).abs() > 0.5 {
             self.animate_to(new_offset, now);
         }
     }
@@ -230,9 +243,7 @@ impl ViewportState {
     }
 
     pub fn is_visible(&self, rect: CGRect, now: Instant) -> bool {
-        let offset = self.scroll_offset(now);
-        let view_left = offset;
-        let view_right = offset + self.screen_width;
+        let (view_left, view_right) = self.view_bounds(now);
         let rect_left = rect.origin.x;
         let rect_right = rect.origin.x + rect.size.width;
         rect_right > view_left && rect_left < view_right
@@ -244,9 +255,7 @@ impl ViewportState {
         frames: Vec<(T, CGRect)>,
         now: Instant,
     ) -> Vec<(T, CGRect)> {
-        let offset = self.scroll_offset(now);
-        let view_left = offset;
-        let view_right = offset + self.screen_width;
+        let (view_left, view_right) = self.view_bounds(now);
 
         frames
             .into_iter()
@@ -457,5 +466,168 @@ mod tests {
         let later = now + std::time::Duration::from_secs(1);
         vp.tick(later);
         assert!(!vp.is_animating(later));
+    }
+
+    /// Three 960 pt columns on a screen at `origin_x`, with the viewport
+    /// settled on `column`.
+    fn settle_on_column(origin_x: f64, column: usize) -> (ViewportState, Vec<(usize, CGRect)>) {
+        let now = Instant::now();
+        let screen = make_rect(origin_x, 0.0, 1920.0, 1080.0);
+        let frames: Vec<(usize, CGRect)> = (0..3)
+            .map(|i| (i, make_rect(origin_x + i as f64 * 960.0, 0.0, 960.0, 1080.0)))
+            .collect();
+        let mut vp = ViewportState::new(screen.size.width);
+        vp.set_screen(screen);
+        let col = frames[column].1;
+        vp.ensure_column_visible(column, col.origin.x, col.size.width, CenterMode::Never, 0.0, now);
+        vp.tick(now + std::time::Duration::from_secs(1));
+        (vp, frames)
+    }
+
+    #[test]
+    fn viewport_on_offset_screen_keeps_first_column_in_place() {
+        for origin_x in [1920.0, -1920.0] {
+            let (vp, frames) = settle_on_column(origin_x, 0);
+            assert_eq!(vp.target_offset(), 0.0, "origin {origin_x}");
+            let screen = make_rect(origin_x, 0.0, 1920.0, 1080.0);
+            let result = vp.apply_viewport_to_frames(screen, frames, Instant::now());
+            let xs: Vec<f64> = result.iter().map(|(_, r)| r.origin.x).collect();
+            assert_eq!(
+                xs,
+                [origin_x, origin_x + 960.0, origin_x + 1920.0],
+                "origin {origin_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_on_offset_screen_scrolls_last_column_to_the_right_edge() {
+        for origin_x in [1920.0, -1920.0] {
+            let (vp, frames) = settle_on_column(origin_x, 2);
+            assert_eq!(vp.target_offset(), 960.0, "origin {origin_x}");
+            let screen = make_rect(origin_x, 0.0, 1920.0, 1080.0);
+            let result = vp.apply_viewport_to_frames(screen, frames.clone(), Instant::now());
+            let xs: Vec<f64> = result.iter().map(|(_, r)| r.origin.x).collect();
+            assert_eq!(
+                xs,
+                [origin_x - 960.0, origin_x, origin_x + 960.0],
+                "origin {origin_x}"
+            );
+
+            let now = Instant::now();
+            assert!(!vp.is_visible(frames[0].1, now));
+            assert!(vp.is_visible(frames[2].1, now));
+            assert_eq!(vp.offset_rect(frames[2].1, now), result[2].1);
+        }
+    }
+
+    #[test]
+    fn retarget_while_animating_keeps_the_offset_continuous() {
+        let now = Instant::now();
+        let mut vp = ViewportState::new(1920.0);
+        vp.animate_to(960.0, now);
+        let at = now + std::time::Duration::from_millis(40);
+        let before = vp.scroll_offset(at);
+        vp.animate_to(0.0, at);
+        assert!((vp.scroll_offset(at) - before).abs() < 1e-9);
+        assert_eq!(vp.target_offset(), 0.0);
+        assert!(vp.is_animating(at));
+        let later = at + std::time::Duration::from_secs(1);
+        vp.tick(later);
+        assert!(!vp.is_animating(later));
+        assert_eq!(vp.scroll_offset(later), 0.0);
+    }
+
+    #[test]
+    fn quick_right_right_left_does_not_scroll_past_the_column() {
+        // Centered 960 pt columns on a 1920 pt screen: each focus change moves
+        // the target by one column.
+        let start = Instant::now();
+        let at = |t| start + std::time::Duration::from_millis(t);
+        let screen = make_rect(0.0, 0.0, 1920.0, 1080.0);
+        let mut vp = ViewportState::new(screen.size.width);
+        vp.set_screen(screen);
+        let focus = |vp: &mut ViewportState, column: usize, t| {
+            let x = column as f64 * 960.0;
+            vp.ensure_column_visible(column, x, 960.0, CenterMode::Always, 0.0, at(t));
+        };
+        vp.snap_to_offset(480.0);
+        focus(&mut vp, 2, 0);
+        focus(&mut vp, 3, 50);
+        focus(&mut vp, 2, 80);
+        let target = vp.target_offset();
+        assert_eq!(target, 1440.0);
+        let before = vp.scroll_offset(at(80));
+        let dir = (target - before).signum();
+        let furthest = (80..=1000)
+            .map(|t| (vp.scroll_offset(at(t)) - target) * dir)
+            .fold(0.0, f64::max);
+        assert!(
+            furthest < 1.0,
+            "scrolled {furthest:.0} pt past the column (from {before:.0})"
+        );
+    }
+
+    #[test]
+    fn non_finite_column_does_not_start_an_animation() {
+        let now = Instant::now();
+        let mut vp = ViewportState::new(1920.0);
+        vp.ensure_column_visible(1, f64::NAN, 960.0, CenterMode::Never, 0.0, now);
+        vp.ensure_column_visible(1, 0.0, f64::NAN, CenterMode::Always, 0.0, now);
+        assert!(!vp.is_animating(now));
+        assert_eq!(vp.target_offset(), 0.0);
+    }
+
+    #[test]
+    fn infinite_column_does_not_start_an_animation() {
+        let now = Instant::now();
+        let mut vp = ViewportState::new(1920.0);
+        vp.ensure_column_visible(1, f64::INFINITY, 960.0, CenterMode::Never, 0.0, now);
+        vp.ensure_column_visible(1, f64::NEG_INFINITY, 960.0, CenterMode::Always, 0.0, now);
+        vp.ensure_column_visible(1, 0.0, f64::INFINITY, CenterMode::OnOverflow, 0.0, now);
+        assert!(!vp.is_animating(now));
+        assert_eq!(vp.target_offset(), 0.0);
+    }
+
+    #[test]
+    fn column_already_visible_does_not_start_an_animation() {
+        let now = Instant::now();
+        let screen = make_rect(1920.0, 0.0, 1920.0, 1080.0);
+        let mut vp = ViewportState::new(screen.size.width);
+        vp.set_screen(screen);
+        vp.ensure_column_visible(1, 1920.0 + 960.0, 960.0, CenterMode::Never, 0.0, now);
+        assert!(!vp.is_animating(now));
+        assert_eq!(vp.target_offset(), 0.0);
+    }
+
+    #[test]
+    fn moving_the_screen_keeps_columns_on_it() {
+        let (mut vp, _) = settle_on_column(0.0, 2);
+        let screen = make_rect(-1920.0, 0.0, 1920.0, 1080.0);
+        vp.set_screen(screen);
+        let frames: Vec<(usize, CGRect)> = (0..3)
+            .map(|i| (i, make_rect(-1920.0 + i as f64 * 960.0, 0.0, 960.0, 1080.0)))
+            .collect();
+        let result = vp.apply_viewport_to_frames(screen, frames, Instant::now());
+        let xs: Vec<f64> = result.iter().map(|(_, r)| r.origin.x).collect();
+        assert_eq!(xs, [-1920.0 - 960.0, -1920.0, -960.0]);
+    }
+
+    #[test]
+    fn frames_mid_animation_are_between_start_and_end() {
+        let now = Instant::now();
+        let screen = make_rect(1920.0, 0.0, 1920.0, 1080.0);
+        let mut vp = ViewportState::new(screen.size.width);
+        vp.set_screen(screen);
+        let col = make_rect(1920.0 + 1920.0, 0.0, 960.0, 1080.0);
+        vp.ensure_column_visible(2, col.origin.x, col.size.width, CenterMode::Never, 0.0, now);
+        assert_eq!(vp.target_offset(), 960.0);
+        let mut prev = f64::INFINITY;
+        for t in (0..=400).step_by(8) {
+            let at = now + std::time::Duration::from_millis(t);
+            let x = vp.offset_rect(col, at).origin.x;
+            assert!(x <= prev && x >= 1920.0 + 960.0, "{t} ms: {x}");
+            prev = x;
+        }
     }
 }

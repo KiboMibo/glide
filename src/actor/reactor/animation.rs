@@ -1,6 +1,8 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::BTreeMap;
+use std::mem;
 use std::time::Duration;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -17,11 +19,43 @@ pub type Receiver = mpsc::UnboundedReceiver<Message>;
 pub enum Message {
     Replace(Animation),
     SkipToEnd(Animation),
+    /// One frame of a scroll animation, computed by the caller. Each window
+    /// moves straight to its `finish` frame.
+    ScrollFrame(Animation),
+    /// The last frame of a scroll animation. Every window that took part in it
+    /// gets a sized frame at its last target, then its animation is ended.
+    ScrollEnd(Animation),
+    /// The reactor accepted a frame for a window from outside Glide, e.g. a
+    /// user resize. If the window takes part in the scroll animation, it ends
+    /// at this frame.
+    ScrollWindowFrame(WindowId, CGRect),
+}
+
+impl Message {
+    pub fn into_animation(self) -> Animation {
+        match self {
+            Message::Replace(animation)
+            | Message::SkipToEnd(animation)
+            | Message::ScrollFrame(animation)
+            | Message::ScrollEnd(animation) => animation,
+            Message::ScrollWindowFrame(..) => Animation::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct AnimationManager {
     active: Option<ActiveAnimation>,
+    /// Windows with a scroll animation begun and not yet ended.
+    scrolling: BTreeMap<WindowId, ScrollingWindow>,
+}
+
+/// The last frame sent to a window in a scroll animation.
+#[derive(Debug)]
+struct ScrollingWindow {
+    handle: AppThreadHandle,
+    frame: CGRect,
+    txid: TransactionId,
 }
 
 #[derive(Debug)]
@@ -85,6 +119,7 @@ impl AnimationManager {
                 message = rx.recv() => {
                     let Some(message) = message else {
                         manager.finish_active();
+                        manager.end_scroll();
                         break;
                     };
                     if let Some(delay) = manager.handle_message(message) {
@@ -102,6 +137,11 @@ impl AnimationManager {
 
     pub fn handle_message(&mut self, message: Message) -> Option<Duration> {
         match message {
+            Message::Replace(_) | Message::SkipToEnd(_) => self.end_scroll(),
+            Message::ScrollFrame(_) | Message::ScrollEnd(_) => self.finish_active(),
+            Message::ScrollWindowFrame(..) => (),
+        }
+        match message {
             Message::Replace(animation) => {
                 self.active = match self.active.take() {
                     Some(active) => Some(active.replace_with(animation)),
@@ -114,6 +154,63 @@ impl AnimationManager {
                 animation.skip_to_end();
                 None
             }
+            Message::ScrollFrame(animation) => {
+                for window in &animation.windows {
+                    let sent = ScrollingWindow {
+                        handle: window.handle.clone(),
+                        frame: window.finish,
+                        txid: window.txid,
+                    };
+                    if self.scrolling.insert(window.wid, sent).is_none() {
+                        _ = window.handle.send(Request::BeginWindowAnimation(window.wid));
+                    }
+                    _ = window.handle.send(Request::AnimationFrame {
+                        wid: window.wid,
+                        frame: window.finish,
+                        set_size: window.start.size != window.finish.size,
+                        txid: window.txid,
+                    });
+                }
+                None
+            }
+            Message::ScrollEnd(animation) => {
+                for window in &animation.windows {
+                    if let Some(sent) = self.scrolling.get_mut(&window.wid) {
+                        sent.frame = window.finish;
+                        sent.txid = window.txid;
+                    } else {
+                        _ = window.handle.send(Request::SetWindowFrame(
+                            window.wid,
+                            window.finish,
+                            window.txid,
+                        ));
+                    }
+                }
+                self.end_scroll();
+                None
+            }
+            Message::ScrollWindowFrame(wid, frame) => {
+                if let Some(sent) = self.scrolling.get_mut(&wid) {
+                    sent.frame = frame;
+                }
+                None
+            }
+        }
+    }
+
+    /// Ends the scroll animation of every begun window. Each first gets a sized
+    /// frame at its last target: EndWindowAnimation re-applies the last sized
+    /// frame with retries, and without this one that would be a stale
+    /// mid-scroll frame.
+    fn end_scroll(&mut self) {
+        for (wid, ScrollingWindow { handle, frame, txid }) in mem::take(&mut self.scrolling) {
+            _ = handle.send(Request::AnimationFrame {
+                wid,
+                frame,
+                set_size: true,
+                txid,
+            });
+            _ = handle.send(Request::EndWindowAnimation(wid));
         }
     }
 
@@ -553,5 +650,427 @@ mod tests {
         assert_animation_frame(&requests[1], wid, rect(50.0, 60.0, 10.0, 10.0));
         assert!(matches!(requests[2], Request::EndWindowAnimation(req_wid) if req_wid == wid));
         assert_set_window_frame(&requests[3], wid, rect(80.0, 90.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn scroll_frames_begin_each_window_once_and_end_all_of_them() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid1 = WindowId::new(1, 1);
+        let wid2 = WindowId::new(1, 2);
+        let wid3 = WindowId::new(1, 3);
+        let mut manager = AnimationManager::new();
+
+        let frame1 = rect(10.0, 0.0, 10.0, 10.0);
+        manager.handle_message(Message::ScrollFrame(animation(
+            &handle,
+            wid1,
+            rect(0.0, 0.0, 10.0, 10.0),
+            frame1,
+        )));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(requests[0], Request::BeginWindowAnimation(w) if w == wid1));
+        assert_animation_pos(&requests[1], wid1, frame1.origin);
+
+        let frame2 = rect(20.0, 0.0, 10.0, 10.0);
+        manager.handle_message(Message::ScrollFrame(animation(&handle, wid1, frame1, frame2)));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(requests.len(), 1);
+        assert_animation_pos(&requests[0], wid1, frame2.origin);
+
+        // wid2 moves on the last frame only; wid3 does not move at the end.
+        let mut last = animation(&handle, wid1, frame2, rect(30.0, 0.0, 10.0, 10.0));
+        last.add_window(
+            &handle,
+            wid2,
+            rect(0.0, 20.0, 10.0, 10.0),
+            rect(5.0, 20.0, 10.0, 10.0),
+            false,
+            TransactionId::default(),
+        );
+        manager.handle_message(Message::ScrollFrame(animation(
+            &handle,
+            wid3,
+            rect(0.0, 40.0, 10.0, 10.0),
+            rect(1.0, 40.0, 10.0, 10.0),
+        )));
+        collect_requests(&mut rx);
+        manager.handle_message(Message::ScrollEnd(last));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert_set_window_frame(&requests[0], wid2, rect(5.0, 20.0, 10.0, 10.0));
+        assert_animation_frame(&requests[1], wid1, rect(30.0, 0.0, 10.0, 10.0));
+        assert!(matches!(requests[2], Request::EndWindowAnimation(w) if w == wid1));
+        assert_animation_frame(&requests[3], wid3, rect(1.0, 40.0, 10.0, 10.0));
+        assert!(matches!(requests[4], Request::EndWindowAnimation(w) if w == wid3));
+        assert!(manager.scrolling.is_empty());
+    }
+
+    #[test]
+    fn scroll_window_frame_sets_the_final_frame_of_a_begun_window_only() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid1 = WindowId::new(1, 1);
+        let wid2 = WindowId::new(1, 2);
+        let mut manager = AnimationManager::new();
+        manager.handle_message(Message::ScrollFrame(animation(
+            &handle,
+            wid1,
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(10.0, 0.0, 10.0, 10.0),
+        )));
+        collect_requests(&mut rx);
+
+        let user_frame = rect(10.0, 0.0, 8.0, 10.0);
+        manager.handle_message(Message::ScrollWindowFrame(wid1, user_frame));
+        manager.handle_message(Message::ScrollWindowFrame(wid2, user_frame));
+        assert!(collect_requests(&mut rx).is_empty());
+
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_animation_frame(&requests[0], wid1, user_frame);
+        assert!(matches!(requests[1], Request::EndWindowAnimation(w) if w == wid1));
+    }
+
+    #[test]
+    fn layout_animation_ends_scroll_animation_first() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid = WindowId::new(1, 1);
+        let mut manager = AnimationManager::new();
+        manager.handle_message(Message::ScrollFrame(animation(
+            &handle,
+            wid,
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(10.0, 0.0, 10.0, 10.0),
+        )));
+        collect_requests(&mut rx);
+
+        manager.handle_message(Message::Replace(animation(
+            &handle,
+            wid,
+            rect(10.0, 0.0, 10.0, 10.0),
+            rect(50.0, 0.0, 10.0, 10.0),
+        )));
+        let requests = collect_requests(&mut rx);
+        assert_animation_frame(&requests[0], wid, rect(10.0, 0.0, 10.0, 10.0));
+        assert!(matches!(requests[1], Request::EndWindowAnimation(w) if w == wid));
+        assert!(matches!(requests[2], Request::BeginWindowAnimation(w) if w == wid));
+    }
+
+    #[test]
+    fn scroll_frame_finishes_layout_animation_first() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid = WindowId::new(1, 1);
+        let mut manager = AnimationManager::new();
+        manager.handle_message(Message::Replace(animation(
+            &handle,
+            wid,
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(50.0, 0.0, 10.0, 10.0),
+        )));
+        collect_requests(&mut rx);
+
+        manager.handle_message(Message::ScrollFrame(animation(
+            &handle,
+            wid,
+            rect(50.0, 0.0, 10.0, 10.0),
+            rect(40.0, 0.0, 10.0, 10.0),
+        )));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert_animation_frame(&requests[0], wid, rect(50.0, 0.0, 10.0, 10.0));
+        assert!(matches!(requests[1], Request::EndWindowAnimation(w) if w == wid));
+        assert!(matches!(requests[2], Request::BeginWindowAnimation(w) if w == wid));
+        assert_animation_pos(&requests[3], wid, CGPoint::new(40.0, 0.0));
+        assert!(manager.active.is_none());
+    }
+
+    /// The frame each window ends at, applying requests the way the app thread
+    /// does: EndWindowAnimation re-applies the last sized animation frame.
+    fn final_frames(requests: &[Request]) -> BTreeMap<WindowId, CGRect> {
+        let mut frames = BTreeMap::new();
+        let mut last_sized = BTreeMap::new();
+        for request in requests {
+            match *request {
+                Request::SetWindowFrame(wid, frame, _) => {
+                    frames.insert(wid, frame);
+                }
+                Request::AnimationFrame { wid, frame, set_size, .. } => {
+                    if set_size {
+                        frames.insert(wid, frame);
+                        last_sized.insert(wid, frame);
+                    } else {
+                        frames.entry(wid).or_insert(frame).origin = frame.origin;
+                    }
+                }
+                Request::BeginWindowAnimation(wid) => {
+                    last_sized.remove(&wid);
+                }
+                Request::EndWindowAnimation(wid) => {
+                    if let Some(frame) = last_sized.remove(&wid) {
+                        frames.insert(wid, frame);
+                    }
+                }
+                _ => {}
+            }
+        }
+        frames
+    }
+
+    /// Three windows get a sized frame, then position-only frames. wid1 moves
+    /// until the end, wid2 parks early and wid3 stops moving before the last
+    /// frame.
+    fn scroll_with_sized_frames_mid_way(
+        manager: &mut AnimationManager,
+        handle: &AppThreadHandle,
+        wids: [WindowId; 3],
+    ) -> BTreeMap<WindowId, CGRect> {
+        let mut last = BTreeMap::new();
+        let mut frame = |wid: WindowId, x: f64, width: f64| {
+            let finish = rect(x, 0.0, width, 10.0);
+            last.insert(wid, finish);
+            (wid, finish)
+        };
+        let steps: [&[(WindowId, CGRect)]; 3] = [
+            &[
+                frame(wids[0], 100.0, 20.0),
+                frame(wids[1], 200.0, 20.0),
+                frame(wids[2], 300.0, 20.0),
+            ],
+            &[
+                frame(wids[0], 90.0, 20.0),
+                frame(wids[1], -20.0, 20.0),
+                frame(wids[2], 290.0, 20.0),
+            ],
+            &[frame(wids[0], 80.0, 20.0)],
+        ];
+        for (i, step) in steps.into_iter().enumerate() {
+            let mut animation = Animation::new();
+            for &(wid, finish) in step {
+                // The size changes on the first frame only.
+                let start = if i == 0 {
+                    rect(0.0, 0.0, 10.0, 10.0)
+                } else {
+                    finish
+                };
+                animation.add_window(handle, wid, start, finish, false, TransactionId::default());
+            }
+            manager.handle_message(Message::ScrollFrame(animation));
+        }
+        last
+    }
+
+    #[test]
+    fn scroll_end_leaves_every_window_at_its_last_frame() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wids = [
+            WindowId::new(1, 1),
+            WindowId::new(1, 2),
+            WindowId::new(1, 3),
+        ];
+        let mut manager = AnimationManager::new();
+        let mut expected = scroll_with_sized_frames_mid_way(&mut manager, &handle, wids);
+
+        let end_frame = rect(70.0, 0.0, 20.0, 10.0);
+        manager.handle_message(Message::ScrollEnd(animation(
+            &handle,
+            wids[0],
+            rect(80.0, 0.0, 20.0, 10.0),
+            end_frame,
+        )));
+        expected.insert(wids[0], end_frame);
+        let requests = collect_requests(&mut rx);
+        assert_eq!(final_frames(&requests), expected);
+        assert!(manager.scrolling.is_empty());
+    }
+
+    #[test]
+    fn empty_scroll_end_leaves_every_window_at_its_last_frame() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wids = [
+            WindowId::new(1, 1),
+            WindowId::new(1, 2),
+            WindowId::new(1, 3),
+        ];
+        let mut manager = AnimationManager::new();
+        let expected = scroll_with_sized_frames_mid_way(&mut manager, &handle, wids);
+
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        let requests = collect_requests(&mut rx);
+        assert_eq!(final_frames(&requests), expected);
+        let ended = requests.iter().filter(|r| matches!(r, Request::EndWindowAnimation(_))).count();
+        assert_eq!(ended, 3);
+    }
+
+    fn scroll_frame(handle: &AppThreadHandle, frames: &[(WindowId, CGRect, u32)]) -> Animation {
+        let mut animation = Animation::new();
+        for &(wid, finish, txid) in frames {
+            animation.add_window(handle, wid, finish, finish, false, TransactionId(txid));
+        }
+        animation
+    }
+
+    /// The sized frame and txid each window gets right before its
+    /// EndWindowAnimation.
+    fn final_sized_frames(requests: &[Request]) -> BTreeMap<WindowId, (CGRect, TransactionId)> {
+        let mut result = BTreeMap::new();
+        for pair in requests.windows(2) {
+            if let [
+                Request::AnimationFrame {
+                    wid,
+                    frame,
+                    set_size: true,
+                    txid,
+                },
+                Request::EndWindowAnimation(ended),
+            ] = pair
+                && wid == ended
+            {
+                result.insert(*wid, (*frame, *txid));
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn final_frame_carries_the_last_txid_of_each_window() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let (w1, w2) = (WindowId::new(1, 1), WindowId::new(1, 2));
+        let mut manager = AnimationManager::new();
+        manager.handle_message(Message::ScrollFrame(scroll_frame(
+            &handle,
+            &[
+                (w1, rect(10.0, 0.0, 10.0, 10.0), 1),
+                (w2, rect(20.0, 0.0, 10.0, 10.0), 1),
+            ],
+        )));
+        manager.handle_message(Message::ScrollFrame(scroll_frame(
+            &handle,
+            &[
+                (w1, rect(15.0, 0.0, 10.0, 10.0), 2),
+                (w2, rect(25.0, 0.0, 10.0, 10.0), 2),
+            ],
+        )));
+        collect_requests(&mut rx);
+        manager.handle_message(Message::ScrollEnd(scroll_frame(
+            &handle,
+            &[(w1, rect(18.0, 0.0, 10.0, 10.0), 3)],
+        )));
+        let finals = final_sized_frames(&collect_requests(&mut rx));
+        assert_eq!(
+            finals,
+            BTreeMap::from([
+                (w1, (rect(18.0, 0.0, 10.0, 10.0), TransactionId(3))),
+                (w2, (rect(25.0, 0.0, 10.0, 10.0), TransactionId(2))),
+            ])
+        );
+    }
+
+    #[test]
+    fn size_change_on_the_last_frame_is_the_final_frame() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid = WindowId::new(1, 1);
+        let mut manager = AnimationManager::new();
+        let mut all = vec![];
+        for x in [100.0, 80.0, 70.0] {
+            manager.handle_message(Message::ScrollFrame(scroll_frame(
+                &handle,
+                &[(wid, rect(x, 0.0, 20.0, 10.0), 1)],
+            )));
+            all.extend(collect_requests(&mut rx));
+        }
+        // The column is resized on the tick that ends the scroll.
+        let resized = rect(65.0, 0.0, 40.0, 10.0);
+        manager.handle_message(Message::ScrollEnd(animation(
+            &handle,
+            wid,
+            rect(70.0, 0.0, 20.0, 10.0),
+            resized,
+        )));
+        all.extend(collect_requests(&mut rx));
+        assert_eq!(final_frames(&all), BTreeMap::from([(wid, resized)]));
+        assert!(
+            !all.iter().any(|r| matches!(r, Request::SetWindowFrame(..))),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn second_scroll_end_in_a_row_ends_nothing_again() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid = WindowId::new(1, 1);
+        let mut manager = AnimationManager::new();
+        manager.handle_message(Message::ScrollFrame(scroll_frame(
+            &handle,
+            &[(wid, rect(10.0, 0.0, 10.0, 10.0), 1)],
+        )));
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        let first = collect_requests(&mut rx);
+        assert_eq!(
+            first.iter().filter(|r| matches!(r, Request::EndWindowAnimation(_))).count(),
+            1
+        );
+
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        assert!(collect_requests(&mut rx).is_empty());
+
+        // The window's animation has ended, so a frame for it in another
+        // ScrollEnd is a plain write.
+        let frame = rect(30.0, 0.0, 10.0, 10.0);
+        manager.handle_message(Message::ScrollEnd(animation(
+            &handle,
+            wid,
+            rect(10.0, 0.0, 10.0, 10.0),
+            frame,
+        )));
+        let second = collect_requests(&mut rx);
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_set_window_frame(&second[0], wid, frame);
+        assert!(manager.scrolling.is_empty());
+    }
+
+    #[test]
+    fn scroll_after_a_scroll_end_begins_the_window_again() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = AppThreadHandle::new_for_test(tx);
+        let wid = WindowId::new(1, 1);
+        let mut manager = AnimationManager::new();
+        let step = |manager: &mut AnimationManager, x| {
+            manager.handle_message(Message::ScrollFrame(scroll_frame(
+                &handle,
+                &[(wid, rect(x, 0.0, 10.0, 10.0), 1)],
+            )));
+        };
+        step(&mut manager, 10.0);
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        step(&mut manager, 20.0);
+        manager.handle_message(Message::ScrollEnd(Animation::new()));
+        let requests = collect_requests(&mut rx);
+        let kinds = requests
+            .iter()
+            .map(|r| match r {
+                Request::BeginWindowAnimation(_) => "begin",
+                Request::AnimationFrame { set_size: false, .. } => "move",
+                Request::AnimationFrame { set_size: true, .. } => "sized",
+                Request::EndWindowAnimation(_) => "end",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "begin", "move", "sized", "end", "begin", "move", "sized", "end"
+            ]
+        );
+        assert_eq!(final_frames(&requests)[&wid], rect(20.0, 0.0, 10.0, 10.0));
     }
 }

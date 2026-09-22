@@ -1,0 +1,31 @@
+{
+  "task": "R1-test",
+  "plan": "docs/plans/2026-09-21-scroll-animation.md",
+  "status": "FAIL",
+  "branch": "test/R1-anim",
+  "base": "wave/scroll-animation-w1@3bd571a",
+  "tests": {
+    "added": 23,
+    "lib_passed": 605,
+    "lib_failed": 2,
+    "lib_ignored": 1,
+    "doc_passed": 7,
+    "failing": [
+      {"name": "model::spring::tests::quick_back_and_forth_retargets_do_not_overshoot", "finding": "F-1"},
+      {"name": "model::scroll_viewport::tests::quick_right_right_left_does_not_scroll_past_the_column", "finding": "F-1"}
+    ],
+    "ignored": [
+      {"name": "actor::reactor::tests::scroll_animation::trace_with_a_scroll_animation_replays_to_the_same_layout", "finding": "F-2"}
+    ]
+  },
+  "coverage": {"changed_lines_percent": null, "reason": "no coverage tool in project; not installed"},
+  "mutations": {"total": 18, "killed": 18, "survived": 0},
+  "findings": [
+    {"id": "F-1", "severity": "важная", "file": "src/model/spring.rs", "line": 73, "summary": "retarget keeps full velocity; a nearer target ahead is overshot by up to ~173 pt (right, right, left)", "fix_verified_on_copy": true},
+    {"id": "F-2", "severity": "важная", "file": "src/actor/reactor.rs", "line": 586, "summary": "scroll ticks are not recorded but consume txids; replay drops later user resizes as stale (pre-existing)"},
+    {"id": "F-3", "severity": "замечание", "file": "src/actor/layout.rs", "line": 1430, "summary": "update_viewport_for_focus reads Instant::now() instead of the reactor's now"},
+    {"id": "F-4", "severity": "замечание", "file": "src/model/scroll_viewport.rs", "line": 165, "summary": "infinite target starts an animation that never completes"},
+    {"id": "F-5", "severity": "замечание", "file": "src/model/scroll_viewport.rs", "line": 280, "summary": "parking at screen edge lands on an adjacent monitor (pre-existing, out of scope)"}
+  ],
+  "report": "docs/plans/reviews/scroll-animation-R1-test.md"
+}

@@ -20,7 +20,7 @@ use crate::config::{Config, NewWindowPlacement, ScrollConfig, WindowRule, Window
 use crate::model::scratchpad::{
     FractionalRect, PendingShowId, ScratchpadAction, ScratchpadWindowState, Scratchpads,
 };
-use crate::model::scroll_viewport::{ScrollPhase, ViewportState, dominant_axis};
+use crate::model::scroll_viewport::{ScrollPhase, ScrollState, ViewportState, dominant_axis};
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
     SpaceLayoutMapping,
@@ -1340,6 +1340,7 @@ impl LayoutManager {
         space: SpaceId,
         screen: CGRect,
         config: &Config,
+        now: Instant,
     ) -> (Vec<(WindowId, CGRect)>, Vec<crate::model::GroupBarInfo>) {
         let layout = self.layout(space);
         let (sizes, mut groups) = self.tree.calculate_layout_and_groups(layout, screen, config);
@@ -1351,9 +1352,9 @@ impl LayoutManager {
         }
         if self.scroll_enabled && self.tree.is_scroll_layout(layout) {
             if let Some(vp) = self.viewports.get(&layout) {
-                let transformed = vp.apply_viewport_to_frames(screen, sizes, Instant::now());
+                let transformed = vp.apply_viewport_to_frames(screen, sizes, now);
                 for group in &mut groups {
-                    group.indicator_frame = vp.offset_rect(group.indicator_frame, Instant::now());
+                    group.indicator_frame = vp.offset_rect(group.indicator_frame, now);
                 }
                 return (transformed, groups);
             }
@@ -1392,7 +1393,13 @@ impl LayoutManager {
         }
     }
 
-    pub fn update_viewport_for_focus(&mut self, space: SpaceId, screen: CGRect, config: &Config) {
+    pub fn update_viewport_for_focus(
+        &mut self,
+        space: SpaceId,
+        screen: CGRect,
+        config: &Config,
+        now: Instant,
+    ) {
         if !self.scroll_enabled {
             return;
         }
@@ -1414,7 +1421,7 @@ impl LayoutManager {
         let gap = config.settings.inner_gap;
 
         let vp = self.viewport_mut(layout, screen.size.width);
-        vp.set_screen_width(screen.size.width);
+        vp.set_screen(screen);
 
         if let Some(wid) = sel_wid {
             if let Some((_, frame)) = frames.iter().find(|(w, _)| *w == wid) {
@@ -1426,23 +1433,38 @@ impl LayoutManager {
                         frame.size.width,
                         center_mode,
                         gap,
-                        Instant::now(),
+                        now,
                     );
                 }
             }
         }
+        if !config.settings.animate {
+            let target = vp.target_offset();
+            vp.snap_to_offset(target);
+        }
     }
 
-    pub fn has_active_scroll_animation(&self) -> bool {
+    pub fn has_active_scroll_animation(&self, now: Instant) -> bool {
         if !self.scroll_enabled {
             return false;
         }
-        self.viewports.values().any(|vp| vp.is_animating(Instant::now()))
+        self.viewports.values().any(|vp| vp.is_animating(now))
     }
 
-    pub fn tick_viewports(&mut self) {
+    pub fn tick_viewports(&mut self, now: Instant) {
         for vp in self.viewports.values_mut() {
-            vp.tick(Instant::now());
+            vp.tick(now);
+        }
+    }
+
+    /// Moves every animating viewport straight to its target.
+    pub fn snap_viewports(&mut self) {
+        for vp in self.viewports.values_mut() {
+            if let ScrollState::Animating(_) = vp.scroll {
+                let target = vp.target_offset();
+                vp.snap_to_offset(target);
+                vp.user_scrolling = false;
+            }
         }
     }
 
@@ -1482,7 +1504,7 @@ impl LayoutManager {
         };
 
         let vp = self.viewport_mut(layout, screen.size.width);
-        vp.set_screen_width(screen.size.width);
+        vp.set_screen(*screen);
 
         let steps = if continuous {
             let scale = sensitivity / CONTINUOUS_SCROLL_REFERENCE_SENSITIVITY;
@@ -1655,10 +1677,16 @@ impl LayoutManager {
         changed
     }
 
-    pub fn end_interactive_resize(&mut self, space: SpaceId, screen: CGRect, config: &Config) {
+    pub fn end_interactive_resize(
+        &mut self,
+        space: SpaceId,
+        screen: CGRect,
+        config: &Config,
+        now: Instant,
+    ) {
         if self.interactive_resize.take().is_some() {
             self.clear_user_scrolling(space);
-            self.update_viewport_for_focus(space, screen, config);
+            self.update_viewport_for_focus(space, screen, config, now);
         }
     }
 
@@ -1734,10 +1762,16 @@ impl LayoutManager {
         false
     }
 
-    pub fn end_interactive_move(&mut self, space: SpaceId, screen: CGRect, config: &Config) {
+    pub fn end_interactive_move(
+        &mut self,
+        space: SpaceId,
+        screen: CGRect,
+        config: &Config,
+        now: Instant,
+    ) {
         if self.interactive_move.take().is_some() {
             self.clear_user_scrolling(space);
-            self.update_viewport_for_focus(space, screen, config);
+            self.update_viewport_for_focus(space, screen, config, now);
         }
     }
 
@@ -3693,6 +3727,157 @@ mod tests {
         assert_eq!(mgr.selected_window(space), Some(WindowId::new(1, 2)));
         _ = mgr.handle_scroll_wheel(space, 1.0, 0.0, false, ScrollPhase::None, &screen);
         assert_eq!(mgr.selected_window(space), Some(WindowId::new(1, 1)));
+    }
+
+    #[test]
+    fn scroll_layout_columns_stay_on_a_screen_with_nonzero_origin() {
+        use LayoutEvent::*;
+
+        for origin_x in [1920, -1920] {
+            let mut config = Config::default();
+            config.settings.experimental.scroll.enable = true;
+            config.settings.default_layout_kind = LayoutKind::Scroll;
+            config.settings.animate = false;
+            let config = Arc::new(config);
+            let mut mgr = LayoutManager::new_for_test();
+            mgr.set_config(&config);
+
+            let space = SpaceId::new(1);
+            let screen = rect(origin_x, 0, 900, 600);
+            let pid = 1;
+            _ = mgr.handle_event(SpaceExposed(space, screen.size));
+            _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 3)));
+
+            let screen_left = screen.origin.x;
+            let screen_right = screen_left + screen.size.width;
+            for idx in [1, 3, 1] {
+                _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, idx)));
+                mgr.update_viewport_for_focus(space, screen, &config, Instant::now());
+                _ = mgr.handle_scroll_wheel(space, 0.0, 0.0, false, ScrollPhase::None, &screen);
+
+                let frames = mgr.calculate_layout(space, screen, &config);
+                let (_, focused) = frames
+                    .iter()
+                    .find(|(wid, _)| *wid == WindowId::new(pid, idx))
+                    .expect("focused window has a frame");
+                assert!(
+                    focused.origin.x >= screen_left
+                        && focused.origin.x + focused.size.width <= screen_right,
+                    "origin {origin_x}, window {idx}: {focused:?} is outside the screen"
+                );
+                for (wid, frame) in &frames {
+                    let left = frame.origin.x;
+                    let right = left + frame.size.width;
+                    assert!(
+                        right >= screen_left - frame.size.width
+                            && left <= screen_right + frame.size.width,
+                        "origin {origin_x}: {wid:?} at {frame:?} is not next to its screen"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_scroll_layouts_animating_at_once_stay_on_their_own_screens() {
+        use LayoutEvent::*;
+
+        let mut config = Config::default();
+        config.settings.experimental.scroll.enable = true;
+        config.settings.default_layout_kind = LayoutKind::Scroll;
+        config.settings.animate = true;
+        let config = Arc::new(config);
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config);
+
+        // Monitors to the left and right of a primary one at [0, 1920].
+        let screens = [
+            (SpaceId::new(1), rect(-1920, 0, 1920, 1080), 1),
+            (SpaceId::new(2), rect(1920, 0, 1920, 1080), 2),
+        ];
+        for &(space, screen, pid) in &screens {
+            _ = mgr.handle_event(SpaceExposed(space, screen.size));
+            _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 4)));
+        }
+        for &(space, screen, pid) in &screens {
+            _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+            mgr.update_viewport_for_focus(space, screen, &config, Instant::now());
+        }
+        let start = Instant::now();
+        assert!(!mgr.has_active_scroll_animation(start));
+        for &(space, screen, pid) in &screens {
+            _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 4)));
+            mgr.update_viewport_for_focus(space, screen, &config, start);
+        }
+        assert!(mgr.has_active_scroll_animation(start));
+
+        for t in (0..=500).step_by(10) {
+            let now = start + std::time::Duration::from_millis(t);
+            for &(space, screen, pid) in &screens {
+                let left = screen.origin.x;
+                let right = left + screen.size.width;
+                let (frames, _) = mgr.calculate_layout_and_groups(space, screen, &config, now);
+                assert_eq!(frames.len(), 4);
+                for (wid, frame) in frames {
+                    assert_eq!(wid.pid, pid);
+                    let (x, w) = (frame.origin.x, frame.size.width);
+                    let on_screen = x + w > left && x < right;
+                    let parked = x == left - w || x == right;
+                    assert!(
+                        on_screen || parked,
+                        "{t} ms, screen at {left}: {wid:?} at {frame:?} is neither on \
+                         its screen nor parked at its edge"
+                    );
+                }
+            }
+        }
+        let end = start + std::time::Duration::from_millis(500);
+        mgr.tick_viewports(end);
+        assert!(!mgr.has_active_scroll_animation(end));
+        for &(space, screen, pid) in &screens {
+            let (frames, _) = mgr.calculate_layout_and_groups(space, screen, &config, end);
+            let (_, focused) =
+                frames.iter().find(|(wid, _)| *wid == WindowId::new(pid, 4)).unwrap();
+            assert!(
+                focused.origin.x >= screen.origin.x
+                    && focused.origin.x + focused.size.width <= screen.origin.x + screen.size.width,
+                "{focused:?} is not inside {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_scroll_starts_at_the_given_time() {
+        use LayoutEvent::*;
+
+        let mut config = Config::default();
+        config.settings.experimental.scroll.enable = true;
+        config.settings.default_layout_kind = LayoutKind::Scroll;
+        config.settings.animate = true;
+        let config = Arc::new(config);
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config);
+
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 1920, 1080);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 4)));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(1, 1)));
+        let start = Instant::now() + std::time::Duration::from_secs(10);
+        mgr.update_viewport_for_focus(space, screen, &config, start);
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(1, 4)));
+        mgr.update_viewport_for_focus(space, screen, &config, start);
+
+        let frame_of_4 = |mgr: &LayoutManager, now| {
+            let (frames, _) = mgr.calculate_layout_and_groups(space, screen, &config, now);
+            frames.into_iter().find(|(wid, _)| *wid == WindowId::new(1, 4)).unwrap().1
+        };
+        let end = start + std::time::Duration::from_secs(1);
+        assert!(mgr.has_active_scroll_animation(start));
+        assert!(!mgr.has_active_scroll_animation(end));
+        assert_eq!(frame_of_4(&mgr, start).origin.x, 1920.0, "starts parked");
+        let x = frame_of_4(&mgr, end).origin.x;
+        assert!((x - 960.0).abs() < 0.5, "ends on screen, got {x}");
     }
 
     #[test]

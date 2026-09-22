@@ -1,0 +1,41 @@
+{
+  "skill": "coding-test",
+  "task": "R1-test round 2",
+  "plan": "docs/plans/2026-09-21-scroll-animation.md",
+  "status": "PASS_WITH_FINDINGS",
+  "date": "2026-09-22",
+  "branch": "test/R1-anim-round2",
+  "base": "fix/F1-anim@14977d7",
+  "scope": {
+    "source": "git-diff:da9000a~1..fix/F1-anim",
+    "files": ["src/model/spring.rs", "src/model/scroll_viewport.rs", "src/actor/layout.rs", "src/actor/reactor.rs", "src/actor/reactor/animation.rs", "src/actor/reactor/testing.rs"]
+  },
+  "round1_findings": {
+    "A1": "closed", "F-1": "closed", "A3/F-3": "closed", "A6": "closed", "F-4": "closed",
+    "A2": "closed", "A4": "closed", "F-2": "open (out of F1 scope, still ignored)", "F-5": "out of scope", "A5": "out of scope"
+  },
+  "tests": {
+    "added": 15,
+    "run_command": "cargo test",
+    "baseline": { "passed": 614, "failed": 0, "ignored": 1 },
+    "final": { "passed": 628, "failed": 0, "ignored": 2 },
+    "doc_passed": 7,
+    "failing": [],
+    "known_defect_marked": [
+      {"name": "actor::reactor::tests::scroll_animation::window_resized_by_the_user_mid_scroll_keeps_the_user_frame_at_the_end", "finding": "N-1"},
+      {"name": "actor::reactor::tests::scroll_animation::trace_with_a_scroll_animation_replays_to_the_same_layout", "finding": "F-2 (round 1)"}
+    ],
+    "flaky": []
+  },
+  "coverage": {"changed_lines_pct": null, "notes": "no coverage tool in project; branches listed in report"},
+  "findings": [
+    {"id": "N-1", "severity": "important", "title": "Final scroll frame undoes a user resize/drag the reactor accepted mid-scroll (F1 regression, reachable only via a notification race)", "file": "src/actor/reactor/animation.rs", "line": 193, "related": "src/actor/reactor.rs:1622", "test": "actor::reactor::tests::scroll_animation::window_resized_by_the_user_mid_scroll_keeps_the_user_frame_at_the_end"},
+    {"id": "N-2", "severity": "note", "title": "Apps harness still creates a gone window on SetWindowFrame and BeginWindowAnimation", "file": "src/actor/reactor/testing.rs", "line": 331}
+  ],
+  "sensitivity_check": {
+    "mutation": {"run": true, "tool": "manual", "total": 18, "killed": 16, "survived": ["H1 (harness check, expected)", "H3 (equivalent)"]},
+    "not_overspecified": {"checked": true, "note": "no failing tests; N-1 fix hypothesis not verified on a copy"}
+  },
+  "report_md": "docs/plans/reviews/scroll-animation-R1-test-round2.md",
+  "next_action": "Wave 1 can proceed; decide whether N-1 needs a fix task (unignore the test to make it blocking)."
+}
