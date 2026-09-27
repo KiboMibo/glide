@@ -109,6 +109,7 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGError",
     "CGGeometry",
     "CGRemoteOperation",
+    "CGSession",
     "CGWindow",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
@@ -145,6 +146,7 @@ notify-debouncer-mini = "0.7.0"
 annotate-snippets = "0.12.10"
 thiserror = "2.0.17"
 itertools = "0.14.0"
+libc = "0.2.186"
 tempfile = { version = "3.17.1", default-features = false }
 
 [dev-dependencies]

@@ -657,6 +657,7 @@ dependencies = [
  "dirs",
  "indexmap 2.13.0",
  "itertools",
+ "libc",
  "livesplit-hotkey",
  "macro_rules_attribute",
  "notify",
