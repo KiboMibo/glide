@@ -56,7 +56,8 @@ struct Cli {
     validate: bool,
 
     /// Restore the layout and enabled spaces saved when Glide last exited in
-    /// this login session. This is the default.
+    /// this login session. This is the default unless auto_restore is off in
+    /// the config.
     ///
     /// Also restores a layout saved by an older version of Glide.
     #[arg(long, overrides_with = "no_restore")]
@@ -214,12 +215,24 @@ impl Cli {
 
 fn restore(opt: &Cli, config: &Arc<Config>) -> (LayoutManager, Option<SpaceState>) {
     let state_path = saved_state_file();
-    let legacy_path = restore_file();
-    if !opt.restore().unwrap_or(true) {
-        for path in [&state_path, &legacy_path] {
-            if let Err(e) = saved_state::discard(path) {
-                error!("Could not discard {}: {e}", path.display());
-            }
+    // Layouts saved by older versions don't record the login session that
+    // saved them, so only restore one when asked to. Otherwise set it aside so
+    // it can't be restored later.
+    let legacy_layout = if opt.restore() == Some(true) {
+        saved_state::take_legacy_layout(&restore_file(), boot_time(), config.clone())
+            .unwrap_or_else(|e| {
+                error!("{e:#}");
+                None
+            })
+    } else {
+        if let Err(e) = saved_state::discard(&restore_file()) {
+            error!("Could not discard {}: {e}", restore_file().display());
+        }
+        None
+    };
+    if !opt.restore().unwrap_or(config.settings.auto_restore) {
+        if let Err(e) = saved_state::discard(&state_path) {
+            error!("Could not discard {}: {e}", state_path.display());
         }
         return (LayoutManager::new(config.clone()), None);
     }
@@ -228,14 +241,8 @@ fn restore(opt: &Cli, config: &Arc<Config>) -> (LayoutManager, Option<SpaceState
         Ok(None) => {}
         Err(e) => error!("{e:#}"),
     }
-    // Layouts saved by older versions don't record the login session that
-    // saved them, so only restore one when asked to.
-    if opt.restore() == Some(true) {
-        match saved_state::take_legacy_layout(&legacy_path, boot_time(), config.clone()) {
-            Ok(Some(layout)) => return (layout, None),
-            Ok(None) => {}
-            Err(e) => error!("{e:#}"),
-        }
+    if let Some(layout) = legacy_layout {
+        return (layout, None);
     }
     (LayoutManager::new(config.clone()), None)
 }

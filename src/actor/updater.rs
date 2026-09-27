@@ -523,10 +523,13 @@ impl Updater {
     }
 
     fn relaunch_args(&self) -> Vec<OsString> {
-        match &self.config_path {
-            Some(path) => vec!["--config".into(), path.clone().into_os_string()],
-            None => Vec::new(),
+        // Updating restarts Glide without the user asking to, so restore even
+        // if auto_restore is off.
+        let mut args = vec!["--restore".into()];
+        if let Some(path) = &self.config_path {
+            args.extend(["--config".into(), path.clone().into_os_string()]);
         }
+        args
     }
 
     fn send_status(&self, status: Option<UpdateStatus>) {

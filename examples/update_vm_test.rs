@@ -13,7 +13,8 @@
 //! site offering the same bundle, and checks that `glide update install`
 //! swaps it in and restarts Glide with its state restored.
 //!
-//! The VM needs Accessibility granted to org.glidewm.glide.
+//! The VM needs Accessibility granted to org.glidewm.glide. The test replaces
+//! the VM user's Glide config.
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -89,7 +90,8 @@ fn copy_to_vm(vm: &str, source: &Path, dest: &str) -> anyhow::Result<()> {
 fn guest(zip: &Path) -> anyhow::Result<()> {
     let app = Path::new(APP);
     let glide = app.join("Contents/MacOS/glide");
-    let data_dir = dirs::home_dir().context("no home directory")?.join(".glide");
+    let home = dirs::home_dir().context("no home directory")?;
+    let data_dir = home.join(".glide");
 
     step("Installing the bundle");
     _ = Command::new("pkill").args(["-x", "glide_server"]).status();
@@ -108,6 +110,13 @@ fn guest(zip: &Path) -> anyhow::Result<()> {
     for file in ["state.ron", "state.prev.ron", "update.log"] {
         remove_file(&data_dir.join(file))?;
     }
+    // Updates restore the saved state even with this off.
+    let config_dir = home.join(".config/glide");
+    fs::create_dir_all(&config_dir)?;
+    fs::write(
+        config_dir.join("glide.toml"),
+        "[settings]\nauto_restore = false\n",
+    )?;
 
     step("Serving a fake update site");
     let base = serve_update_site(zip, &version)?;

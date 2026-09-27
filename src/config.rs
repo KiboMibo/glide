@@ -96,6 +96,7 @@ enum Disabled {
 pub struct Settings {
     pub animate: bool,
     pub default_disable: bool,
+    pub auto_restore: bool,
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,

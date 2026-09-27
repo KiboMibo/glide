@@ -10,6 +10,10 @@ animate = true
 # toggle_space_activated command to enable a space.
 default_disable = true
 
+# Restore the layout and enabled spaces saved when Glide last exited in the
+# same login session. The --restore and --no-restore launch flags override this.
+auto_restore = true
+
 # Focus the window under the mouse as it moves.
 focus_follows_mouse = true
 

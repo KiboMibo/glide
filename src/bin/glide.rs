@@ -103,7 +103,8 @@ struct CmdLaunch {
     config: Option<PathBuf>,
 
     /// Restore the layout and enabled spaces saved when Glide last exited in
-    /// this login session. This is the default.
+    /// this login session. This is the default unless auto_restore is off in
+    /// the config.
     ///
     /// Also restores a layout saved by an older version of Glide.
     #[arg(long, overrides_with = "no_restore")]

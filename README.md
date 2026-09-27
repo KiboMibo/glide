@@ -75,6 +75,9 @@ fresh layout instead, run:
 glide launch --no-restore
 ```
 
+To start fresh by default, set `auto_restore = false` under `[settings]` in your
+config. `glide launch --restore` then restores for that launch.
+
 Saved state is not restored after logging out or restarting your machine.
 
 ### Running Glide at login
