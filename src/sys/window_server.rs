@@ -52,6 +52,8 @@ impl Into<u32> for WindowServerId {
     }
 }
 
+/// Note that this can return kCGNullWindowID for some non-window elements; see
+/// https://github.com/tmandry/glide/issues/248.
 impl TryFrom<&AXUIElement> for WindowServerId {
     type Error = accessibility::Error;
     fn try_from(element: &AXUIElement) -> Result<Self, accessibility::Error> {
@@ -59,13 +61,6 @@ impl TryFrom<&AXUIElement> for WindowServerId {
         let res = unsafe { _AXUIElementGetWindow(element.as_sys(), &mut id) };
         if let Some(err) = accessibility::AXError::from_raw(res) {
             return Err(accessibility::Error::Ax(err));
-        }
-        // macOS 27: some elements (observed on Control Center) report success
-        // without writing an id. 0 is kCGNullWindowID, so treat it as missing
-        // and let callers take their no-window-server-id fallback instead of
-        // panicking downstream.
-        if id == 0 {
-            return Err(accessibility::Error::Ax(accessibility::AXError::Failure));
         }
         Ok(WindowServerId(id))
     }

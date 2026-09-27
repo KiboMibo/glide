@@ -78,8 +78,7 @@ impl WindowId {
         }
     }
 
-    /// Returns `None` if the window server id is 0 (kCGNullWindowID), which
-    /// macOS 27 can report for non-window elements such as Control Center's.
+    /// Returns `None` if the window server id is 0 (kCGNullWindowID).
     pub fn with_wsid(pid: pid_t, wsid: WindowServerId) -> Option<Self> {
         assert!(wsid.0 & MANUAL_INDEX_MASK == 0, "WindowServerId out of range");
         Some(WindowId {
