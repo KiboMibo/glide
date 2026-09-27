@@ -42,6 +42,7 @@ pub enum Event {
     ExposeActive(bool),
     ReactorCommand(reactor::Command),
     ConfigUpdated(Arc<Config>),
+    SaveAndExit,
 }
 
 pub type Sender = crate::actor::Sender<Event>;
@@ -191,6 +192,7 @@ impl SpaceManager {
             Event::ReactorCommand(cmd) => {
                 self.reactor_tx.send(reactor::Event::Command(cmd));
             }
+            Event::SaveAndExit => self.reactor_tx.send(reactor::Event::SaveAndExit),
             Event::ConfigUpdated(config) => {
                 self.config = config.clone();
                 self.reactor_tx.send(reactor::Event::ConfigChanged(config));

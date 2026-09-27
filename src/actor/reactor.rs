@@ -201,6 +201,9 @@ pub enum Event {
 
     Command(Command),
     ConfigChanged(Arc<Config>),
+
+    /// Save the layout, then exit.
+    SaveAndExit,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -219,7 +222,6 @@ pub enum Command {
 pub enum ReactorCommand {
     Debug,
     Serialize,
-    SaveAndExit,
 }
 
 pub struct Reactor {
@@ -857,7 +859,7 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 println!("{}", self.layout.serialize_to_string());
             }
-            Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
+            Event::SaveAndExit => {
                 info!("SaveAndExit command received");
                 match self.layout.save(crate::config::restore_file()) {
                     Ok(()) => std::process::exit(0),

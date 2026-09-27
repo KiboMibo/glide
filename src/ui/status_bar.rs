@@ -16,7 +16,6 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSData, NSObject, NSString, ns_string};
 use tracing::{Span, debug, error, warn};
 
-use crate::actor::reactor;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
 use crate::config;
 
@@ -193,9 +192,7 @@ define_class!(
                     debug!("Sending SaveAndExit command");
                     let _ = wm_tx.send((
                         Span::current(),
-                        WmEvent::Command(WmCommand::ReactorCommand(
-                            reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit),
-                        )),
+                        WmEvent::Command(WmCommand::Wm(WmCmd::SaveAndExit)),
                     ));
                 }
                 TOGGLE_GLOBAL_TAG => {

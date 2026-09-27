@@ -95,6 +95,7 @@ impl MainWindowTracker {
             | Event::LeftMouseDragged(_)
             | Event::Command(..)
             | Event::ConfigChanged(_)
+            | Event::SaveAndExit
             | Event::WindowsOnScreenUpdated { .. } => return None,
         };
         if Some(event_pid) == self.global_frontmost && quiet_edge == Quiet::No {
