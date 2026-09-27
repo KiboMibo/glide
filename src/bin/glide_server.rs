@@ -19,6 +19,7 @@ use glide_wm::actor::saved_state::{self, SavedState};
 use glide_wm::actor::server::MessageServer;
 use glide_wm::actor::space_manager::SpaceState;
 use glide_wm::actor::status::Status;
+use glide_wm::actor::updater::Updater;
 use glide_wm::actor::window_server::{self, SkylightWatcher};
 use glide_wm::actor::wm_controller::{self, WmController};
 use glide_wm::actor::{channel, server};
@@ -168,7 +169,18 @@ fn main() {
     let notification_center =
         NotificationCenter::new(wm_controller_tx.clone(), notification_center_ws_tx);
     let mouse = Mouse::new(config.clone(), events_tx.clone(), mouse_rx);
-    let status = Status::new(config.clone(), status_rx, mtm, wm_controller_tx.clone());
+    let updater_tx = Updater::spawn(
+        opt.config.as_ref().and_then(|p| p.canonicalize().ok()),
+        status_tx.clone(),
+        wm_controller_tx.clone(),
+    );
+    let status = Status::new(
+        config.clone(),
+        status_rx,
+        mtm,
+        wm_controller_tx.clone(),
+        updater_tx,
+    );
     let group_bars = GroupBars::new(config.clone(), group_indicators_rx, mtm);
     let dock = Dock::new(dock_sm_tx);
 

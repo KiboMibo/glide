@@ -128,6 +128,7 @@ regex = "1.11.1"
 ron = "0.12.0"
 rustc-hash = "2.0.0"
 serde = { version = "1.0.201", features = ["derive", "rc"] }
+serde_json = "1.0.149"
 serde_with = "3.9.0"
 slotmap = { version = "1.0.7", features = ["serde"] }
 sorted-vec = "0.8.10"

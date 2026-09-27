@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::borrow::Borrow;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use clap::{Parser, Subcommand};
 use glide_wm::actor::server::{
     self, AsciiEscaped, PROTOCOL_VERSION, Request, Response, ServiceRequest,
 };
+use glide_wm::actor::updater::install;
 use glide_wm::config::{Config, config_path};
 use glide_wm::sys::bundle::{self, BundleError};
 use glide_wm::sys::message_port::{RemoteMessagePort, RemotePortCreateError, SendError};
@@ -43,6 +45,34 @@ enum Command {
     Resume,
     /// Show the versions of the CLI and the running server.
     Version,
+    #[command(subcommand, hide = true)]
+    Update(CmdUpdateGlide),
+}
+
+/// Manage updates to Glide.
+#[derive(Subcommand, Clone)]
+enum CmdUpdateGlide {
+    /// Replace an installed Glide with the bundle this command runs from, then
+    /// launch it.
+    ///
+    /// Glide runs this from a downloaded update. Its arguments must stay
+    /// compatible with every older version that might run it.
+    Install(CmdInstall),
+}
+
+#[derive(Parser, Clone)]
+struct CmdInstall {
+    /// The installed bundle to replace.
+    #[arg(long)]
+    target: PathBuf,
+
+    /// Wait for this process to exit before replacing the bundle.
+    #[arg(long)]
+    wait_pid: Option<i32>,
+
+    /// Arguments to launch the new version with.
+    #[arg(last = true)]
+    args: Vec<OsString>,
 }
 
 /// Manage Glide as a system service.
@@ -142,6 +172,7 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
         Command::Version => version()?,
+        Command::Update(CmdUpdateGlide::Install(cmd)) => install_update(cmd)?,
         Command::Pause => set_enabled(make_client()?, false)?,
         Command::Resume => set_enabled(make_client()?, true)?,
         Command::Config(CmdConfig {
@@ -204,6 +235,29 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+fn install_update(cmd: CmdInstall) -> Result<(), anyhow::Error> {
+    let source = match bundle::glide_bundle() {
+        Ok(bundle) => PathBuf::from(bundle.bundlePath().to_string()),
+        Err(_) => bail!("Not running from a Glide bundle"),
+    };
+    eprintln!(
+        "Installing Glide {} from {} to {}",
+        env!("CARGO_PKG_VERSION"),
+        source.display(),
+        cmd.target.display()
+    );
+    if let Some(pid) = cmd.wait_pid {
+        install::wait_for_exit(pid)?;
+    }
+    let result = install::replace_bundle(&source, &cmd.target);
+    match &result {
+        Ok(()) => eprintln!("Installed; launching {}", cmd.target.display()),
+        Err(e) => eprintln!("Install failed; relaunching the existing version: {e:#}"),
+    }
+    install::launch(&cmd.target, &cmd.args)?;
+    result
 }
 
 fn version() -> Result<(), anyhow::Error> {
