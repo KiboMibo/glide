@@ -103,9 +103,18 @@ jobs:
         run: |
           codesign -v target/*-apple-darwin/release/Glide_*.dmg
 
+      # Glide's self-updater downloads these instead of the disk images.
+      - name: Archive app bundles
+        run: |
+          for dmg in target/*-apple-darwin/release/Glide_*.dmg; do
+            ditto -c -k --keepParent "$(dirname "$dmg")/Glide.app" "${dmg%.dmg}.app.zip"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
-          path: target/*-apple-darwin/release/Glide_*.dmg
+          path: |
+            target/*-apple-darwin/release/Glide_*.dmg
+            target/*-apple-darwin/release/Glide_*.app.zip
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -114,6 +123,8 @@ jobs:
           files: |
             target/aarch64-apple-darwin/release/Glide_*.dmg
             target/x86_64-apple-darwin/release/Glide_*.dmg
+            target/aarch64-apple-darwin/release/Glide_*.app.zip
+            target/x86_64-apple-darwin/release/Glide_*.app.zip
           fail_on_unmatched_files: true
           body_path: CHANGELOG_version.md
           # To keep release-please's notes, comment the line above and uncomment
