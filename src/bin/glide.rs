@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use glide_wm::actor::server::{
     self, AsciiEscaped, PROTOCOL_VERSION, Request, Response, ServiceRequest,
 };
-use glide_wm::actor::updater::install;
+use glide_wm::actor::updater::{UpdaterState, install};
 use glide_wm::config::{Config, config_path};
 use glide_wm::sys::bundle::{self, BundleError};
 use glide_wm::sys::message_port::{RemoteMessagePort, RemotePortCreateError, SendError};
@@ -45,23 +45,28 @@ enum Command {
     Resume,
     /// Show the versions of the CLI and the running server.
     Version,
-    #[command(subcommand, hide = true)]
+    #[command(subcommand)]
     Update(CmdUpdateGlide),
 }
 
-/// Manage updates to Glide.
+/// Check for and install updates to Glide.
 #[derive(Subcommand, Clone)]
 enum CmdUpdateGlide {
+    /// Check whether an update is available.
+    Check,
+    /// Install the available update and restart Glide.
+    Install,
     /// Replace an installed Glide with the bundle this command runs from, then
     /// launch it.
     ///
     /// Glide runs this from a downloaded update. Its arguments must stay
     /// compatible with every older version that might run it.
-    Install(CmdInstall),
+    #[command(hide = true)]
+    Apply(CmdApply),
 }
 
 #[derive(Parser, Clone)]
-struct CmdInstall {
+struct CmdApply {
     /// The installed bundle to replace.
     #[arg(long)]
     target: PathBuf,
@@ -172,7 +177,12 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
         Command::Version => version()?,
-        Command::Update(CmdUpdateGlide::Install(cmd)) => install_update(cmd)?,
+        Command::Update(CmdUpdateGlide::Check) => match check_for_update(&make_client()?)? {
+            Some(version) => println!("Glide {version} is available"),
+            None => println!("Glide is up to date"),
+        },
+        Command::Update(CmdUpdateGlide::Install) => install_update(&make_client()?)?,
+        Command::Update(CmdUpdateGlide::Apply(cmd)) => apply_update(cmd)?,
         Command::Pause => set_enabled(make_client()?, false)?,
         Command::Resume => set_enabled(make_client()?, true)?,
         Command::Config(CmdConfig {
@@ -237,7 +247,123 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn install_update(cmd: CmdInstall) -> Result<(), anyhow::Error> {
+/// How long to wait for the new version to start after the old one exits.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many status requests in a row can fail while waiting for the server to
+/// exit before giving up.
+const MAX_EXIT_FAILURES: u32 = 5;
+
+fn update_status(client: &Client) -> Result<UpdaterState, anyhow::Error> {
+    match client.send(Request::UpdateStatus) {
+        Ok(Response::UpdateStatus(status)) => Ok(status),
+        Ok(resp) => bail!("Unexpected response: {resp:?}"),
+        // Servers that can't update respond with an empty message.
+        Err(ClientError::SerializationError(_)) => {
+            bail!("The running version of Glide can't update itself")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn expect_success(response: Response) -> Result<(), anyhow::Error> {
+    match response {
+        Response::Success => Ok(()),
+        Response::Error(e) => bail!("{e}"),
+        resp => bail!("Unexpected response: {resp:?}"),
+    }
+}
+
+/// Call `f` until it returns a value.
+///
+/// We need this because CFMessagePort is synchronous, and we don't want to
+/// block other messages (or the main thread) during update operations.
+fn poll<T>(mut f: impl FnMut() -> Result<Option<T>, anyhow::Error>) -> Result<T, anyhow::Error> {
+    loop {
+        if let Some(value) = f()? {
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Check for an update, returning the version available if there is one.
+fn check_for_update(client: &Client) -> Result<Option<String>, anyhow::Error> {
+    let before = update_status(client)?;
+    if let Some(reason) = before.disabled {
+        bail!("Updates are disabled: {reason}");
+    }
+    expect_success(client.send(Request::CheckForUpdate)?)?;
+    let status = poll(|| {
+        let status = update_status(client)?;
+        Ok((status.checks > before.checks || status.disabled.is_some()).then_some(status))
+    })?;
+    if let Some(reason) = status.disabled {
+        bail!("Updates are disabled: {reason}");
+    }
+    if let Some(e) = status.error {
+        bail!("Checking for updates failed: {e}");
+    }
+    Ok(status.available)
+}
+
+fn install_update(client: &Client) -> Result<(), anyhow::Error> {
+    let Some(version) = check_for_update(client)? else {
+        println!("Glide is up to date");
+        return Ok(());
+    };
+    println!("Installing Glide {version}");
+    expect_success(client.send(Request::InstallUpdate)?)?;
+    // Wait for the server to exit, which it does once it hands off to the new
+    // version. A request in flight as it exits can fail in other ways before
+    // its port is seen to be gone, so retry those a few times.
+    let mut failures = 0;
+    poll(|| match update_status(client) {
+        Ok(status) if status.installing => {
+            failures = 0;
+            Ok(None)
+        }
+        Ok(status) => bail!("Installing failed: {}", status.error.unwrap_or_default()),
+        Err(e) if is_server_gone(&e) => Ok(Some(())),
+        Err(_) if failures < MAX_EXIT_FAILURES => {
+            failures += 1;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    })?;
+    println!("Waiting for Glide to restart");
+    let start = std::time::Instant::now();
+    let running = poll(|| {
+        if start.elapsed() > RESTART_TIMEOUT {
+            bail!("Glide did not restart. See ~/.glide/update.log for details.");
+        }
+        let Ok(client) = Client::new() else { return Ok(None) };
+        let hello = Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: PROTOCOL_VERSION,
+        };
+        match client.send(hello) {
+            Ok(Response::Hello { server_version, .. }) => Ok(Some(server_version)),
+            _ => Ok(None),
+        }
+    })?;
+    if running != version {
+        bail!(
+            "Glide restarted with version {running} instead of {version}. \
+             See ~/.glide/update.log for details."
+        );
+    }
+    println!("Glide restarted with version {version}");
+    Ok(())
+}
+
+fn is_server_gone(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ClientError>(),
+        Some(ClientError::SendError(SendError::InvalidPort))
+    )
+}
+
+fn apply_update(cmd: CmdApply) -> Result<(), anyhow::Error> {
     let source = match bundle::glide_bundle() {
         Ok(bundle) => PathBuf::from(bundle.bundlePath().to_string()),
         Err(_) => bail!("Not running from a Glide bundle"),

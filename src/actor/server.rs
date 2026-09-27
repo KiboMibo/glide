@@ -13,6 +13,7 @@ use objc2_service_management::SMAppService;
 use serde::{Deserialize, Serialize};
 use tracing::{Span, error, info, instrument, warn};
 
+use crate::actor::updater::{UpdaterHandle, UpdaterState};
 use crate::actor::wm_controller;
 use crate::config::Config;
 use crate::sys::message_port::{LocalMessagePort, LocalPortCreateError};
@@ -39,6 +40,12 @@ pub enum Request {
     Service(ServiceRequest),
     /// Pause (false) or resume (true) global window management.
     SetEnabled(bool),
+    /// Start checking for an update. Poll `UpdateStatus` for the result.
+    CheckForUpdate,
+    /// Start installing the available update. The server exits when it
+    /// hands off to the new version.
+    InstallUpdate,
+    UpdateStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -56,6 +63,7 @@ pub enum Response {
     },
     Success,
     Error(String),
+    UpdateStatus(UpdaterState),
 }
 
 pub struct MessageServer {
@@ -67,11 +75,16 @@ pub struct MessageServer {
 
 struct State {
     wm_tx: wm_controller::Sender,
+    updater: UpdaterHandle,
 }
 
 impl MessageServer {
-    pub fn new(name: &str, wm_tx: wm_controller::Sender) -> Result<Self, LocalPortCreateError> {
-        let state = Rc::new(RefCell::new(State { wm_tx }));
+    pub fn new(
+        name: &str,
+        wm_tx: wm_controller::Sender,
+        updater: UpdaterHandle,
+    ) -> Result<Self, LocalPortCreateError> {
+        let state = Rc::new(RefCell::new(State { wm_tx, updater }));
         let state_ = state.clone();
         Ok(MessageServer {
             port: LocalMessagePort::new(name, move |id, msg| {
@@ -134,6 +147,25 @@ impl State {
                 ));
                 Response::Success
             }
+            Request::CheckForUpdate => {
+                self.updater.check();
+                Response::Success
+            }
+            Request::InstallUpdate => {
+                let state = self.updater.state();
+                if let Some(reason) = state.disabled {
+                    return Response::Error(format!("Updates are disabled: {reason}"));
+                }
+                if state.installing {
+                    return Response::Error("An update is already being installed".to_owned());
+                }
+                if state.available.is_none() {
+                    return Response::Error("No update available".to_owned());
+                }
+                self.updater.install();
+                Response::Success
+            }
+            Request::UpdateStatus => Response::UpdateStatus(self.updater.state()),
             Request::Service(ServiceRequest::Install) => {
                 // SAFETY: ? Requirements unclear.
                 let result = unsafe { SMAppService::mainAppService().registerAndReturnError() };
@@ -179,7 +211,10 @@ mod tests {
     #[test]
     fn hello_reports_server_version() {
         let (wm_tx, _wm_rx) = mpsc::unbounded_channel();
-        let mut state = State { wm_tx };
+        let mut state = State {
+            wm_tx,
+            updater: UpdaterHandle::new_for_test(),
+        };
         let response = request(
             &mut state,
             &Request::Hello {
@@ -192,5 +227,18 @@ mod tests {
         };
         assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(protocol, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn rejects_install_while_installing() {
+        let (wm_tx, _wm_rx) = mpsc::unbounded_channel();
+        let updater = UpdaterHandle::new_for_test();
+        updater.install();
+        let mut state = State { wm_tx, updater };
+        let response = request(&mut state, &Request::InstallUpdate);
+        let Response::Error(e) = response else {
+            panic!("unexpected response {response:?}");
+        };
+        assert!(e.contains("already being installed"), "{e}");
     }
 }

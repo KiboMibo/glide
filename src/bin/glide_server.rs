@@ -169,7 +169,7 @@ fn main() {
     let notification_center =
         NotificationCenter::new(wm_controller_tx.clone(), notification_center_ws_tx);
     let mouse = Mouse::new(config.clone(), events_tx.clone(), mouse_rx);
-    let updater_tx = Updater::spawn(
+    let updater = Updater::spawn(
         opt.config.as_ref().and_then(|p| p.canonicalize().ok()),
         status_tx.clone(),
         wm_controller_tx.clone(),
@@ -179,13 +179,13 @@ fn main() {
         status_rx,
         mtm,
         wm_controller_tx.clone(),
-        updater_tx,
+        updater.sender(),
     );
     let group_bars = GroupBars::new(config.clone(), group_indicators_rx, mtm);
     let dock = Dock::new(dock_sm_tx);
 
     // TODO: Run on another thread so we don't tie up the main thread.
-    let message_server = MessageServer::new(server::PORT_NAME, wm_controller_tx)
+    let message_server = MessageServer::new(server::PORT_NAME, wm_controller_tx, updater)
         .expect("Glide may be already running");
 
     Executor::run_main(mtm, async move {

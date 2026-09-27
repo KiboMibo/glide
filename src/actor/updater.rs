@@ -16,7 +16,7 @@
 //! and uses the first one that exists. Only a 404 moves on to the next; any
 //! other failure means no update is offered. The manifest names a release on
 //! GitHub, whose zipped app bundle is downloaded, verified, and handed to the
-//! new version's `glide update install` to swap in once this process exits.
+//! new version's `glide update apply` to swap in once this process exits.
 
 pub mod install;
 
@@ -26,11 +26,11 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{Span, error, info, warn};
 
 use crate::actor::{status, wm_controller};
@@ -40,6 +40,8 @@ const DEFAULT_MANIFEST_BASE: &str = "https://glidewm.org/update/v1";
 const DEFAULT_RELEASES_API: &str = "https://api.github.com/repos/glide-wm/glide/releases";
 const MANIFEST_BASE_ENV: &str = "GLIDE_UPDATE_MANIFEST_URL";
 const RELEASES_API_ENV: &str = "GLIDE_UPDATE_RELEASES_URL";
+/// Set to override the version this process believes it is, for testing updates.
+const CURRENT_VERSION_ENV: &str = "GLIDE_UPDATE_CURRENT_VERSION";
 
 /// Code signing requirement a bundle must satisfy to be installed.
 pub const CODE_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \
@@ -55,10 +57,65 @@ const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug)]
 pub enum Request {
+    Check,
     Install,
 }
 
 pub type Sender = mpsc::Sender<Request>;
+
+/// The updater's state, as reported to the CLI.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct UpdaterState {
+    /// Why updates are disabled, if they are.
+    pub disabled: Option<String>,
+    /// The number of checks completed.
+    pub checks: u64,
+    pub available: Option<String>,
+    pub installing: bool,
+    /// The error from the last check or install, if it failed.
+    pub error: Option<String>,
+}
+
+/// A handle to send requests to the updater and read its state.
+#[derive(Clone)]
+pub struct UpdaterHandle {
+    tx: Sender,
+    state: Arc<Mutex<UpdaterState>>,
+}
+
+impl UpdaterHandle {
+    pub fn sender(&self) -> Sender {
+        self.tx.clone()
+    }
+
+    pub fn check(&self) {
+        _ = self.tx.send(Request::Check);
+    }
+
+    /// Start installing the available update.
+    ///
+    /// The state shows the install in progress from when this returns.
+    pub fn install(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.installing = true;
+            state.error = None;
+        }
+        _ = self.tx.send(Request::Install);
+    }
+
+    pub fn state(&self) -> UpdaterState {
+        self.state.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        UpdaterHandle {
+            tx: mpsc::channel().0,
+            state: Default::default(),
+        }
+    }
+}
 
 /// What the status menu should show about updates.
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +305,7 @@ pub struct Updater {
     status_tx: status::Sender,
     wm_tx: wm_controller::Sender,
     available: Option<Available>,
+    state: Arc<Mutex<UpdaterState>>,
 }
 
 impl Updater {
@@ -260,25 +318,31 @@ impl Updater {
         config_path: Option<PathBuf>,
         status_tx: status::Sender,
         wm_tx: wm_controller::Sender,
-    ) -> Sender {
+    ) -> UpdaterHandle {
         let (tx, rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(UpdaterState::default()));
+        let current = std::env::var(CURRENT_VERSION_ENV)
+            .ok()
+            .and_then(|v| Version::parse(&v))
+            .unwrap_or_else(Version::current);
         let updater = Updater {
             manifest_base: std::env::var(MANIFEST_BASE_ENV)
                 .unwrap_or_else(|_| DEFAULT_MANIFEST_BASE.to_owned()),
             releases_api: std::env::var(RELEASES_API_ENV)
                 .unwrap_or_else(|_| DEFAULT_RELEASES_API.to_owned()),
-            current: Version::current(),
+            current,
             config_path,
             handed_off: false,
             status_tx,
             wm_tx,
             available: None,
+            state: state.clone(),
         };
         std::thread::Builder::new()
             .name("updater".to_owned())
             .spawn(move || updater.run(rx))
             .unwrap();
-        tx
+        UpdaterHandle { tx, state }
     }
 
     fn run(mut self, rx: mpsc::Receiver<Request>) {
@@ -286,6 +350,7 @@ impl Updater {
             Ok(bundle) => bundle,
             Err(e) => {
                 info!("Not checking for updates: {e:#}");
+                self.state.lock().unwrap().disabled = Some(format!("{e:#}"));
                 return;
             }
         };
@@ -296,6 +361,7 @@ impl Updater {
                 .unwrap_or(Duration::ZERO)
                 .min(MAX_WAIT);
             match rx.recv_timeout(wait) {
+                Ok(Request::Check) => self.check(),
                 Ok(Request::Install) => self.install(&bundle),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if SystemTime::now() >= next_check {
@@ -309,7 +375,16 @@ impl Updater {
     }
 
     fn check(&mut self) {
-        match self.find_update() {
+        let result = self.find_update();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.checks += 1;
+            state.error = result.as_ref().err().map(|e| format!("{e:#}"));
+            if let Ok(available) = &result {
+                state.available = available.as_ref().map(|a| a.version.to_string());
+            }
+        }
+        match result {
             Ok(Some(available)) => {
                 info!("Update available: {}", available.version);
                 self.send_status(Some(UpdateStatus::Available(available.version)));
@@ -354,10 +429,24 @@ impl Updater {
         }
         let Some(available) = self.available.clone() else {
             warn!("Install requested with no update available");
+            let mut state = self.state.lock().unwrap();
+            state.installing = false;
+            state.error = Some("No update available".to_owned());
             return;
         };
         self.send_status(Some(UpdateStatus::Installing(available.version)));
-        match self.stage_and_hand_off(&available, bundle) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.installing = true;
+            state.error = None;
+        }
+        let result = self.stage_and_hand_off(&available, bundle);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.installing = result.is_ok();
+            state.error = result.as_ref().err().map(|e| format!("{e:#}"));
+        }
+        match result {
             Ok(()) => {
                 info!("Handed off update to {}; exiting", available.version);
                 _ = self.wm_tx.send((
@@ -417,7 +506,7 @@ impl Updater {
         let log = update_log()?;
         let mut install = Command::new(&cli);
         install
-            .args(["update", "install", "--target"])
+            .args(["update", "apply", "--target"])
             .arg(bundle)
             .arg("--wait-pid")
             .arg(std::process::id().to_string())
@@ -603,5 +692,28 @@ mod tests {
         let release: Release = serde_json::from_str(json).unwrap();
         let update = select_update(&release, Version(0, 2, 15), "aarch64").unwrap().unwrap();
         assert_eq!(update.version, Version(0, 2, 16));
+    }
+
+    #[test]
+    fn install_without_update_clears_installing() {
+        let handle = UpdaterHandle::new_for_test();
+        handle.install();
+        let (status_tx, _status_rx) = crate::actor::channel();
+        let (wm_tx, _wm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut updater = Updater {
+            manifest_base: String::new(),
+            releases_api: String::new(),
+            current: Version::current(),
+            config_path: None,
+            handed_off: false,
+            status_tx,
+            wm_tx,
+            available: None,
+            state: handle.state.clone(),
+        };
+        updater.install(Path::new("/Applications/Glide.app"));
+        let state = handle.state();
+        assert!(!state.installing);
+        assert!(state.error.is_some());
     }
 }
