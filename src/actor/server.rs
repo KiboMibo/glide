@@ -19,9 +19,22 @@ use crate::sys::message_port::{LocalMessagePort, LocalPortCreateError};
 
 pub const PORT_NAME: &str = "org.glidewm.server";
 
+/// The version of the request and response protocol.
+///
+/// Incremented when requests or responses change in a way that an older client
+/// or server can't handle.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     Ping(String),
+    /// Exchange versions so either side can adapt to the other.
+    ///
+    /// Servers from before this request respond with an empty message.
+    Hello {
+        client_version: String,
+        protocol: u32,
+    },
     UpdateConfig(Config),
     Service(ServiceRequest),
     /// Pause (false) or resume (true) global window management.
@@ -37,6 +50,10 @@ pub enum ServiceRequest {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     Pong(String),
+    Hello {
+        server_version: String,
+        protocol: u32,
+    },
     Success,
     Error(String),
 }
@@ -97,6 +114,10 @@ impl State {
                 let resp = payload.chars().into_iter().rev().collect();
                 Response::Pong(resp)
             }
+            Request::Hello { .. } => Response::Hello {
+                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol: PROTOCOL_VERSION,
+            },
             Request::UpdateConfig(config) => {
                 _ = self.wm_tx.send((
                     Span::current(),
@@ -141,5 +162,35 @@ impl Display for AsciiEscaped<'_> {
             write!(f, "{}", std::ascii::escape_default(*byte))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    fn request(state: &mut State, request: &Request) -> Response {
+        let message = ron::ser::to_string(request).unwrap();
+        ron::de::from_bytes(&state.handle_message(0, message.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn hello_reports_server_version() {
+        let (wm_tx, _wm_rx) = mpsc::unbounded_channel();
+        let mut state = State { wm_tx };
+        let response = request(
+            &mut state,
+            &Request::Hello {
+                client_version: "0.0.0".to_owned(),
+                protocol: PROTOCOL_VERSION,
+            },
+        );
+        let Response::Hello { server_version, protocol } = response else {
+            panic!("unexpected response {response:?}");
+        };
+        assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(protocol, PROTOCOL_VERSION);
     }
 }

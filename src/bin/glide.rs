@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use glide_wm::actor::server::{self, AsciiEscaped, Request, Response, ServiceRequest};
+use glide_wm::actor::server::{
+    self, AsciiEscaped, PROTOCOL_VERSION, Request, Response, ServiceRequest,
+};
 use glide_wm::config::{Config, config_path};
 use glide_wm::sys::bundle::{self, BundleError};
 use glide_wm::sys::message_port::{RemoteMessagePort, RemotePortCreateError, SendError};
@@ -39,6 +41,8 @@ enum Command {
     Pause,
     /// Resume window management after pausing.
     Resume,
+    /// Show the versions of the CLI and the running server.
+    Version,
 }
 
 /// Manage Glide as a system service.
@@ -137,6 +141,7 @@ fn main() -> Result<(), anyhow::Error> {
                 _ => bail!("Unexpected response"),
             }
         }
+        Command::Version => version()?,
         Command::Pause => set_enabled(make_client()?, false)?,
         Command::Resume => set_enabled(make_client()?, true)?,
         Command::Config(CmdConfig {
@@ -198,6 +203,34 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
+    Ok(())
+}
+
+fn version() -> Result<(), anyhow::Error> {
+    println!(
+        "client: {} (protocol {PROTOCOL_VERSION})",
+        env!("CARGO_PKG_VERSION")
+    );
+    let server = match Client::new() {
+        Err(_) => "not running".to_owned(),
+        Ok(client) => {
+            let hello = Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol: PROTOCOL_VERSION,
+            };
+            match client.send(hello) {
+                Ok(Response::Hello { server_version, protocol }) => {
+                    format!("{server_version} (protocol {protocol})")
+                }
+                // Servers from before the Hello request respond with an empty
+                // message.
+                Err(ClientError::SerializationError(_)) => "unknown (older version)".to_owned(),
+                Ok(resp) => bail!("Unexpected response: {resp:?}"),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    println!("server: {server}");
     Ok(())
 }
 
