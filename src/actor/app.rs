@@ -1154,12 +1154,10 @@ impl State {
         if !register_notifs(&elem, self, wsid) {
             return None;
         }
-        let wid = wsid
-            .and_then(|id| WindowId::with_wsid(self.pid, id))
-            .unwrap_or_else(|| {
-                self.last_window_idx += 1;
-                WindowId::with_manual_index(self.pid, self.last_window_idx)
-            });
+        let wid = wsid.and_then(|id| WindowId::with_wsid(self.pid, id)).unwrap_or_else(|| {
+            self.last_window_idx += 1;
+            WindowId::with_manual_index(self.pid, self.last_window_idx)
+        });
         let old = self.windows.insert(
             wid,
             WindowState {
