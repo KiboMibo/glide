@@ -60,6 +60,13 @@ impl TryFrom<&AXUIElement> for WindowServerId {
         if let Some(err) = accessibility::AXError::from_raw(res) {
             return Err(accessibility::Error::Ax(err));
         }
+        // macOS 27: some elements (observed on Control Center) report success
+        // without writing an id. 0 is kCGNullWindowID, so treat it as missing
+        // and let callers take their no-window-server-id fallback instead of
+        // panicking downstream.
+        if id == 0 {
+            return Err(accessibility::Error::Ax(accessibility::AXError::Failure));
+        }
         Ok(WindowServerId(id))
     }
 }
