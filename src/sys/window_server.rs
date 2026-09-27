@@ -52,6 +52,8 @@ impl Into<u32> for WindowServerId {
     }
 }
 
+/// Note that this can return kCGNullWindowID for some non-window elements; see
+/// https://github.com/tmandry/glide/issues/248.
 impl TryFrom<&AXUIElement> for WindowServerId {
     type Error = accessibility::Error;
     fn try_from(element: &AXUIElement) -> Result<Self, accessibility::Error> {

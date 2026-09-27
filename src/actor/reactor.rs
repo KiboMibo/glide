@@ -2007,8 +2007,8 @@ pub mod tests {
             space: Some(SpaceId::new(1)),
             scale_factor: 2.0,
         }];
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
         reactor.windows.insert(
             w1,
             super::WindowState {
@@ -2072,8 +2072,8 @@ pub mod tests {
     #[test]
     fn filter_response_keeps_response_when_focus_is_not_frontmost() {
         let reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
 
         let response = reactor.filter_response(
             layout::EventResponse {

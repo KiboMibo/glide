@@ -78,12 +78,13 @@ impl WindowId {
         }
     }
 
-    pub fn with_wsid(pid: pid_t, wsid: WindowServerId) -> Self {
+    /// Returns `None` if the window server id is 0 (kCGNullWindowID).
+    pub fn with_wsid(pid: pid_t, wsid: WindowServerId) -> Option<Self> {
         assert!(wsid.0 & MANUAL_INDEX_MASK == 0, "WindowServerId out of range");
-        WindowId {
+        Some(WindowId {
             pid,
-            idx: NonZeroU32::new(wsid.0).expect("WindowServerId was zero"),
-        }
+            idx: NonZeroU32::new(wsid.0)?,
+        })
     }
 
     pub fn wsid(&self) -> Option<WindowServerId> {
@@ -1152,7 +1153,7 @@ impl State {
         if !register_notifs(&elem, self, wsid) {
             return None;
         }
-        let wid = wsid.map(|id| WindowId::with_wsid(self.pid, id)).unwrap_or_else(|| {
+        let wid = wsid.and_then(|id| WindowId::with_wsid(self.pid, id)).unwrap_or_else(|| {
             self.last_window_idx += 1;
             WindowId::with_manual_index(self.pid, self.last_window_idx)
         });
@@ -1213,11 +1214,10 @@ impl State {
     }
 
     fn id(&self, elem: &AXUIElement) -> Result<WindowId, accessibility::Error> {
-        if let Ok(id) = WindowServerId::try_from(elem) {
-            let wid = WindowId {
-                pid: self.pid,
-                idx: NonZeroU32::new(id.as_u32()).expect("Window server id was 0"),
-            };
+        if let Ok(id) = WindowServerId::try_from(elem)
+            && let Some(idx) = NonZeroU32::new(id.as_u32())
+        {
+            let wid = WindowId { pid: self.pid, idx };
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
             }
