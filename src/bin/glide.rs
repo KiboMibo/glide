@@ -63,10 +63,16 @@ struct CmdLaunch {
     #[arg(long, short)]
     config: Option<PathBuf>,
 
-    /// Restore the layout saved with the save_and_exit command. This is only
-    /// useful within the same login session.
-    #[arg(long)]
+    /// Restore the layout and enabled spaces saved when Glide last exited in
+    /// this login session. This is the default.
+    ///
+    /// Also restores a layout saved by an older version of Glide.
+    #[arg(long, overrides_with = "no_restore")]
     restore: bool,
+
+    /// Start with a fresh layout instead of restoring the saved one.
+    #[arg(long, overrides_with = "restore")]
+    no_restore: bool,
 }
 
 /// Manage server config.
@@ -104,7 +110,14 @@ fn main() -> Result<(), anyhow::Error> {
     let make_client = || Client::new().context("Could not find server");
 
     match opt.command {
-        Command::Launch(CmdLaunch { config, restore }) => launch(config, restore)?,
+        Command::Launch(CmdLaunch { config, restore, no_restore }) => {
+            let restore = match (restore, no_restore) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            launch(config, restore)?
+        }
         Command::Service(req) => {
             let (req, verb) = match req {
                 CmdService::Install => (ServiceRequest::Install, "registered"),
@@ -199,7 +212,7 @@ fn set_enabled(client: Client, enabled: bool) -> Result<(), anyhow::Error> {
     }
 }
 
-fn launch(config: Option<PathBuf>, restore: bool) -> Result<(), anyhow::Error> {
+fn launch(config: Option<PathBuf>, restore: Option<bool>) -> Result<(), anyhow::Error> {
     match bundle::glide_bundle() {
         Err(BundleError::NotInBundle) => bail!(
             "Not running in a bundle.
@@ -226,8 +239,10 @@ fn launch(config: Option<PathBuf>, restore: bool) -> Result<(), anyhow::Error> {
                 args.push("--config".into());
                 args.push(path.canonicalize()?.into_os_string());
             }
-            if restore {
-                args.push("--restore".into());
+            match restore {
+                Some(true) => args.push("--restore".into()),
+                Some(false) => args.push("--no-restore".into()),
+                None => {}
             }
             bundle::launch(&bundle, &args)?;
             eprintln!(

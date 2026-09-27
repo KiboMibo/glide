@@ -29,8 +29,13 @@ pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
 }
 
+/// The layout saved by versions of Glide before [`saved_state_file`].
 pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
+}
+
+pub fn saved_state_file() -> PathBuf {
+    data_dir().join("state.ron")
 }
 
 pub fn config_path() -> PathBuf {

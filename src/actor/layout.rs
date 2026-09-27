@@ -1604,11 +1604,16 @@ impl LayoutManager {
     pub fn load(path: PathBuf, config: Arc<Config>) -> anyhow::Result<Self> {
         let mut buf = String::new();
         File::open(path)?.read_to_string(&mut buf)?;
-        let mut manager: Self = ron::from_str(&buf)?;
+        let manager: Self = ron::from_str(&buf)?;
+        Ok(manager.with_restored_config(config))
+    }
+
+    /// Attach the config to a deserialized layout.
+    pub fn with_restored_config(mut self, config: Arc<Config>) -> Self {
         // Only the field, not `set_config`: the caller applies the config, and
         // `set_config` also converts layouts the config no longer allows.
-        manager.config = config;
-        Ok(manager)
+        self.config = config;
+        self
     }
 
     pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
