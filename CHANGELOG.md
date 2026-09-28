@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.16](https://github.com/tmandry/glide/compare/v0.2.15...v0.2.16) (2026-09-28)
+
+This release makes it easier to restart and update Glide without losing your
+workspace. It also adds a new layout command and fixes a crash on macOS 27.
+
+### Features
+
+* Glide now saves your layout and enabled Spaces when you quit, then restores
+  them the next time it starts during the same login session. Run
+  `glide launch --no-restore` to start fresh once, or set `auto_restore = false`
+  under `[settings]` to start fresh by default ([e715fec](https://github.com/tmandry/glide/commit/e715fec0e853ac5daa0ccfff3b5c904797898f13), [c40d9bd](https://github.com/tmandry/glide/commit/c40d9bd2de52e17072a25958b7acff37fcd92ddc)).
+* Install available updates from the Glide status menu or with
+  `glide update check` and `glide update install`. Glide restarts automatically
+  with your workspace restored ([d860272](https://github.com/tmandry/glide/commit/d86027265d049abae962ce766cdf2f8e4165af43), [da88e91](https://github.com/tmandry/glide/commit/da88e91d33f6ef0bcf88a6dd4c9894e583665b8d)).
+* Bind `toggle_orientation` to a key to switch a container between horizontal
+  and vertical layouts, or a group between tabbed and stacked layouts
+  ([#237](https://github.com/tmandry/glide/pull/237)).
+* Use `glide version` to show both the installed CLI version and the version of
+  the running Glide server ([f1171a8](https://github.com/tmandry/glide/commit/f1171a80aecefd48e14b20ea1d87450687e3329c)).
+
+### Bug Fixes
+
+* Prevent a crash on macOS 27 when using Mission Control to add or remove a
+  Space ([#248](https://github.com/tmandry/glide/issues/248)).
+* Fix the Space toggle becoming stuck after changing the `default_disable`
+  setting ([be72d69](https://github.com/tmandry/glide/commit/be72d695fbafbe0227cfcabec3e8ea5b2dcfd16b)).
+
 ## [0.2.15](https://github.com/tmandry/glide/compare/v0.2.14...v0.2.15) (2026-08-09)
 
 When a window is floated, Glide now remembers the original size and position of the window. This release brings a ton of reliability improvements for when windows move between spaces and screens, focus changes, and windows are resized or floated. It also improves compatibility with certain apps.
