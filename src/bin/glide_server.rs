@@ -15,19 +15,23 @@ use glide_wm::actor::layout::LayoutManager;
 use glide_wm::actor::mouse::Mouse;
 use glide_wm::actor::notification_center::NotificationCenter;
 use glide_wm::actor::reactor::{self, Reactor};
+use glide_wm::actor::saved_state::{self, SavedState};
 use glide_wm::actor::server::MessageServer;
+use glide_wm::actor::space_manager::SpaceState;
 use glide_wm::actor::status::Status;
+use glide_wm::actor::updater::Updater;
 use glide_wm::actor::window_server::{self, SkylightWatcher};
 use glide_wm::actor::wm_controller::{self, WmController};
 use glide_wm::actor::{channel, server};
-use glide_wm::config::{Config, restore_file};
+use glide_wm::config::{Config, restore_file, saved_state_file};
 use glide_wm::log;
 use glide_wm::sys::executor::Executor;
+use glide_wm::sys::session::{LoginSessionId, boot_time};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSApp, NSApplicationActivationPolicy};
 use objc2_foundation::ns_string;
 use tokio::join;
-use tracing::warn;
+use tracing::{error, warn};
 
 #[derive(Parser)]
 #[command(version, name = "glide_server")]
@@ -46,15 +50,22 @@ struct Cli {
     #[arg(long)]
     no_animate: bool,
 
-    /// Check whether the restore file can be loaded without actually starting
+    /// Check whether the saved state can be loaded without actually starting
     /// the window manager.
     #[arg(long)]
     validate: bool,
 
-    /// Restore the layout saved with the save_and_exit command. This is only
-    /// useful within the same login session.
-    #[arg(long)]
+    /// Restore the layout and enabled spaces saved when Glide last exited in
+    /// this login session. This is the default unless auto_restore is off in
+    /// the config.
+    ///
+    /// Also restores a layout saved by an older version of Glide.
+    #[arg(long, overrides_with = "no_restore")]
     restore: bool,
+
+    /// Start with a fresh layout instead of restoring the saved one.
+    #[arg(long, overrides_with = "restore")]
+    no_restore: bool,
 
     /// Record reactor events to the specified file path. Overwrites the file if
     /// exists.
@@ -109,15 +120,11 @@ fn main() {
     NSApp(mtm).finishLaunching();
 
     if opt.validate {
-        LayoutManager::load(restore_file(), config.clone()).unwrap();
+        SavedState::load(&saved_state_file(), config.clone()).unwrap();
         return;
     }
 
-    let layout = if opt.restore {
-        LayoutManager::load(restore_file(), config.clone()).unwrap()
-    } else {
-        LayoutManager::new(config.clone())
-    };
+    let (layout, restored_spaces) = restore(&opt, &config);
     let (mouse_tx, mouse_rx) = channel();
     let (status_tx, status_rx) = channel();
 
@@ -157,17 +164,29 @@ fn main() {
         sm_tx,
         sm_rx,
         skylight_tx,
+        restored_spaces,
     );
 
     let notification_center =
         NotificationCenter::new(wm_controller_tx.clone(), notification_center_ws_tx);
     let mouse = Mouse::new(config.clone(), events_tx.clone(), mouse_rx);
-    let status = Status::new(config.clone(), status_rx, mtm, wm_controller_tx.clone());
+    let updater = Updater::spawn(
+        opt.config.as_ref().and_then(|p| p.canonicalize().ok()),
+        status_tx.clone(),
+        wm_controller_tx.clone(),
+    );
+    let status = Status::new(
+        config.clone(),
+        status_rx,
+        mtm,
+        wm_controller_tx.clone(),
+        updater.sender(),
+    );
     let group_bars = GroupBars::new(config.clone(), group_indicators_rx, mtm);
     let dock = Dock::new(dock_sm_tx);
 
     // TODO: Run on another thread so we don't tie up the main thread.
-    let message_server = MessageServer::new(server::PORT_NAME, wm_controller_tx)
+    let message_server = MessageServer::new(server::PORT_NAME, wm_controller_tx, updater)
         .expect("Glide may be already running");
 
     Executor::run_main(mtm, async move {
@@ -182,6 +201,50 @@ fn main() {
             message_server.run(),
         );
     });
+}
+
+impl Cli {
+    fn restore(&self) -> Option<bool> {
+        match (self.restore, self.no_restore) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+fn restore(opt: &Cli, config: &Arc<Config>) -> (LayoutManager, Option<SpaceState>) {
+    let state_path = saved_state_file();
+    // Layouts saved by older versions don't record the login session that
+    // saved them, so only restore one when asked to. Otherwise set it aside so
+    // it can't be restored later.
+    let legacy_layout = if opt.restore() == Some(true) {
+        saved_state::take_legacy_layout(&restore_file(), boot_time(), config.clone())
+            .unwrap_or_else(|e| {
+                error!("{e:#}");
+                None
+            })
+    } else {
+        if let Err(e) = saved_state::discard(&restore_file()) {
+            error!("Could not discard {}: {e}", restore_file().display());
+        }
+        None
+    };
+    if !opt.restore().unwrap_or(config.settings.auto_restore) {
+        if let Err(e) = saved_state::discard(&state_path) {
+            error!("Could not discard {}: {e}", state_path.display());
+        }
+        return (LayoutManager::new(config.clone()), None);
+    }
+    match SavedState::take(&state_path, LoginSessionId::current().as_ref(), config.clone()) {
+        Ok(Some(state)) => return (state.layout, Some(state.spaces)),
+        Ok(None) => {}
+        Err(e) => error!("{e:#}"),
+    }
+    if let Some(layout) = legacy_layout {
+        return (layout, None);
+    }
+    (LayoutManager::new(config.clone()), None)
 }
 
 fn install_panic_hook() {

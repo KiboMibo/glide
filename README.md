@@ -66,15 +66,19 @@ To exit Glide, type ⌥⇧E.
 
 ### Save and restore
 
-If you need to update Glide or restart it for any reason, exit with the
-`save_and_exit` key binding (default ⌥⇧E). Then, when starting again,
-run it with the `--restore` flag:
+When you exit Glide with the `save_and_exit` key binding (default ⌥⇧E) or
+the Quit menu item, it saves your layout and which spaces are enabled. The next
+time Glide starts in the same login session, it restores them. To start with a
+fresh layout instead, run:
 
 ```
-glide launch --restore
+glide launch --no-restore
 ```
 
-Note that this does not work across machine restarts.
+To start fresh by default, set `auto_restore = false` under `[settings]` in your
+config. `glide launch --restore` then restores for that launch.
+
+Saved state is not restored after logging out or restarting your machine.
 
 ### Running Glide at login
 

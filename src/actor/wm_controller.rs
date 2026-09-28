@@ -59,6 +59,8 @@ pub enum WmCmd {
     SetGlobalEnabled(bool),
     ToggleSpaceActivated,
     Exec(ExecCmd),
+    /// Save the layout and enabled spaces, then exit.
+    SaveAndExit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +212,9 @@ impl WmController {
             }
             Command(Wm(Exec(cmd))) => {
                 self.exec_cmd(cmd);
+            }
+            Command(Wm(SaveAndExit)) => {
+                self.sm_tx.send(space_manager::Event::SaveAndExit);
             }
             Command(ReactorCommand(cmd)) => {
                 self.sm_tx.send(space_manager::Event::ReactorCommand(cmd));
