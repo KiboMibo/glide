@@ -266,20 +266,25 @@ impl SpaceManager {
     }
 
     fn is_space_enabled(&self, space: SpaceId) -> bool {
-        match space {
-            sp if self.config.settings.default_disable => self.enabled_spaces.contains(&sp),
-            sp => !self.disabled_spaces.contains(&sp),
+        if self.disabled_spaces.contains(&space) {
+            false
+        } else if self.enabled_spaces.contains(&space) {
+            true
+        } else {
+            !self.config.settings.default_disable
         }
     }
 
     fn toggle_space(&mut self, space: SpaceId) {
-        let toggle_set = if self.config.settings.default_disable {
-            &mut self.enabled_spaces
-        } else {
-            &mut self.disabled_spaces
-        };
-        if !toggle_set.remove(&space) {
-            toggle_set.insert(space);
+        let enable = !self.is_space_enabled(space);
+        // Clear overrides left over from before default_disable changed, and
+        // record one only when it differs from the default.
+        self.enabled_spaces.remove(&space);
+        self.disabled_spaces.remove(&space);
+        match (enable, self.config.settings.default_disable) {
+            (true, true) => _ = self.enabled_spaces.insert(space),
+            (false, false) => _ = self.disabled_spaces.insert(space),
+            _ => {}
         }
         if !self.is_space_enabled(space) {
             self.group_indicators_tx.send(group_bars::Event::SpaceDisabled(space));
@@ -297,10 +302,8 @@ impl SpaceManager {
             let enabled = match space {
                 _ if self.login_window_active => false,
                 Some(_) if self.one_space && *space != self.starting_space => false,
-                Some(sp) if self.disabled_spaces.contains(sp) => false,
-                Some(sp) if self.enabled_spaces.contains(sp) => true,
-                _ if self.config.settings.default_disable => false,
-                _ => true,
+                Some(sp) => self.is_space_enabled(*sp),
+                None => !self.config.settings.default_disable,
             };
             if !enabled {
                 *space = None;
@@ -636,6 +639,24 @@ mod tests {
         h.send_space_changed(vec![Some(space(10))]);
         let events = drain(&mut h.reactor_rx);
         assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn toggle_enables_space_disabled_under_the_other_default() {
+        // Disabled while default_disable was false, now restored with it true.
+        let restored = SpaceState {
+            enabled: Default::default(),
+            disabled: [space(10)].into(),
+            globally_enabled: true,
+        };
+        let mut h = TestHarness::new_restored(false, Config::default(), Some(restored));
+        h.setup_space(screen(1), space(10));
+
+        h.on_event(Event::ToggleSpace(screen(1)));
+        h.drain_all();
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![Some(space(10))]);
     }
 
     #[test]
