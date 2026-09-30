@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use accessibility_sys::pid_t;
-use objc2_app_kit::NSScreen;
+use objc2_app_kit::{NSRunningApplication, NSScreen};
 use objc2_foundation::MainThreadMarker;
 use serde::{Deserialize, Serialize};
 use tokio::join;
@@ -25,6 +25,7 @@ type StartupReceiver = mpsc::UnboundedReceiver<()>;
 use crate::actor::app::AppInfo;
 use crate::actor::{self, mouse, reactor, space_manager, status, window_server};
 use crate::sys;
+use crate::sys::app::NSRunningApplicationExt;
 use crate::sys::bundle::CommandOutput;
 use crate::sys::event::HotkeyManager;
 use crate::sys::screen::{NSScreenExt, get_ns_screens};
@@ -247,6 +248,9 @@ impl WmController {
     }
 
     fn new_app(&mut self, pid: pid_t, info: AppInfo, startup: Option<StartupToken>) {
+        if pid == NSRunningApplication::currentApplication().pid() {
+            return;
+        }
         if info.bundle_id.as_deref() == Some("com.apple.loginwindow") {
             if let Some(prev) = self.login_window_pid {
                 warn!("Multiple loginwindow instances found: {prev:?} and {pid:?}");
