@@ -37,7 +37,8 @@ use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
 use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
-use crate::actor::space_manager::SpaceManager;
+use crate::actor::saved_state::SavedState;
+use crate::actor::space_manager::{SpaceManager, SpaceState};
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
 use crate::collections::{HashMap, HashSet};
 use crate::config::{Config, ScrollModifier};
@@ -137,8 +138,9 @@ pub enum Event {
     /// the launch failed or the window did not appear in time.
     ScratchpadShowExpired(PendingShowId),
 
-    /// Moving a scratchpad window to the current space was not confirmed in
-    /// time, or could not be started. The window is shown where it is.
+    /// Moving a scratchpad window to the current space, or a new window to the
+    /// desktop of its window rule, was not confirmed in time or could not be
+    /// started. The window is shown or added to the layout where it is.
     ScratchpadMoveEnded(SpaceMoveId),
 
     WindowsDiscovered {
@@ -233,6 +235,9 @@ pub enum Event {
 
     Command(Command),
     ConfigChanged(Arc<Config>),
+
+    /// Save the state along with the space state, then exit.
+    SaveAndExit(SpaceState),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -271,7 +276,6 @@ pub enum Command {
 pub enum ReactorCommand {
     Debug,
     Serialize,
-    SaveAndExit,
     /// Shows or hides the scratchpad window with the given name.
     ToggleScratchpad {
         name: String,
@@ -311,7 +315,14 @@ pub struct Reactor {
     /// Scratchpad windows being moved to the current space. Each is placed and
     /// focused once it is on screen or its move ends.
     pending_space_moves: BTreeMap<WindowId, PendingSpaceMove>,
+    /// New windows being moved to the desktop of their window rule. They are
+    /// left out of the layout until the move ends, so they do not flash into
+    /// the current space.
+    pending_rule_moves: BTreeMap<WindowId, SpaceMoveId>,
     next_space_move_id: u64,
+    /// Whether `StartupComplete` was received. Window rules only move windows
+    /// that open after startup, not the windows that are already open.
+    startup_complete: bool,
     record: Record,
     /// Only [`Reactor::spawn`] installs one that acts on the system, so tests
     /// and replays never do.
@@ -396,7 +407,7 @@ struct Screen {
     scale_factor: f64,
 }
 
-/// Identifies one move of a scratchpad window to the current space.
+/// Identifies one move of a window to another space.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceMoveId(u64);
 
@@ -472,6 +483,7 @@ impl Reactor {
         sm_tx: space_manager::Sender,
         sm_rx: space_manager::Receiver,
         skylight_tx: window_server::SkylightSender,
+        restored_spaces: Option<SpaceState>,
     ) {
         thread::Builder::new()
             .name("reactor".to_string())
@@ -493,6 +505,7 @@ impl Reactor {
                     status_tx,
                     group_indicators_tx,
                     mouse_tx,
+                    restored_spaces,
                 );
                 let window_server = window_server::WindowServer::new(sm_tx, wm_tx, skylight_tx);
                 Executor::run(async move {
@@ -534,7 +547,9 @@ impl Reactor {
             resizing_window: None,
             frame_attempts: HashMap::default(),
             pending_space_moves: BTreeMap::new(),
+            pending_rule_moves: BTreeMap::new(),
             next_space_move_id: 0,
+            startup_complete: false,
             record,
             system: Box::new(NoSystem),
             raise_manager_tx,
@@ -618,9 +633,10 @@ impl Reactor {
                 main_window: _,
             } => {
                 self.apps.insert(pid, AppState { info, handle });
-                self.on_windows_discovered(pid, visible_windows, vec![]);
+                self.on_windows_discovered(pid, visible_windows, vec![], true);
             }
             Event::StartupComplete => {
+                self.startup_complete = true;
                 self.send_layout_event(LayoutEvent::AppsRunningUpdated(
                     self.apps.keys().copied().collect(),
                 ));
@@ -637,10 +653,20 @@ impl Reactor {
                     self.layout.cancel_scratchpad_shows_for_app(bundle_id);
                 }
                 self.pending_space_moves.retain(|wid, _| wid.pid != pid);
+                self.pending_rule_moves.retain(|wid, _| wid.pid != pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
             }
             Event::ScratchpadMoveEnded(id) => {
-                if let Some((&wid, _)) = self.pending_space_moves.iter().find(|(_, m)| m.id == id) {
+                if let Some((&wid, _)) = self.pending_rule_moves.iter().find(|(_, m)| **m == id) {
+                    self.pending_rule_moves.remove(&wid);
+                    // The window is still here if the move did not happen.
+                    if self.window_is_visible(wid) && !self.layout.has_window(wid) {
+                        debug!(?wid, "Window was not moved to its desktop; adding it here");
+                        animation_focus_wids.extend(self.add_visible_window(wid));
+                    }
+                } else if let Some((&wid, _)) =
+                    self.pending_space_moves.iter().find(|(_, m)| m.id == id)
+                {
                     let moved = self.pending_space_moves.remove(&wid).unwrap();
                     debug!(?wid, "Showing scratchpad window without waiting for its move");
                     self.place_scratchpad(wid, moved.frame);
@@ -679,7 +705,7 @@ impl Reactor {
                 // Handled by MainWindowTracker.
             }
             Event::WindowsDiscovered { pid, new, known_visible } => {
-                self.on_windows_discovered(pid, new, known_visible);
+                self.on_windows_discovered(pid, new, known_visible, false);
             }
             Event::WindowCreated(wid, window, mouse_state) => {
                 // TODO: It's possible for a window to be on multiple spaces
@@ -689,6 +715,7 @@ impl Reactor {
                     self.window_ids.insert(wsid, wid);
                 }
                 self.windows.insert(wid, window.clone().into());
+                self.move_to_rule_desktop(wid);
                 if mouse_state == MouseState::Down {
                     self.in_drag = true;
                     // Suppress updates while left button is pressed in case
@@ -703,19 +730,8 @@ impl Reactor {
                 self.place_moved_scratchpads();
             }
             Event::WindowBecameVisible(wid) => {
-                if self.window_is_tracked(wid)
-                    && let Some(window) = self.windows.get(&wid)
-                    && let Some(info) = self.layout_window_info(wid)
-                {
-                    match self.best_space_for_window(&window.frame_monotonic) {
-                        Some(space) => {
-                            animation_focus_wids.push(wid);
-                            self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
-                        }
-                        None => self.send_layout_event(LayoutEvent::ScratchpadCandidates(vec![(
-                            wid, info,
-                        )])),
-                    }
+                if !self.pending_rule_moves.contains_key(&wid) {
+                    animation_focus_wids.extend(self.add_visible_window(wid));
                 }
             }
             Event::WindowDestroyed(wid) => {
@@ -726,6 +742,7 @@ impl Reactor {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
                 self.pending_space_moves.remove(&wid);
+                self.pending_rule_moves.remove(&wid);
                 self.frame_attempts.remove(&wid);
                 //animation_focus_wid = self.window_order.last().cloned();
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
@@ -1060,19 +1077,10 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 println!("{}", self.layout.serialize_to_string());
             }
-            Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
-                info!("SaveAndExit command received");
-                match self.layout.save(crate::config::restore_file()) {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        error!("Could not save layout: {e}");
-                        std::process::exit(3);
-                    }
-                }
-            }
             Event::Command(Command::Reactor(ReactorCommand::ToggleScratchpad { name, launch })) => {
                 self.toggle_scratchpad(&name, launch.as_deref());
             }
+            Event::SaveAndExit(spaces) => self.save_and_exit(spaces),
             Event::ConfigChanged(config) => {
                 self.layout.set_config(&config);
                 self.config = config;
@@ -1091,6 +1099,17 @@ impl Reactor {
             self.update_layout(&animation_focus_wids, is_resize);
         } else if !self.layout.has_interactive_state() {
             self.interrupt_scroll_animation();
+        }
+    }
+
+    fn save_and_exit(&self, spaces: SpaceState) -> ! {
+        info!("SaveAndExit command received");
+        match SavedState::save(&self.layout, spaces, &crate::config::saved_state_file()) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                error!("Could not save state: {e}");
+                std::process::exit(3);
+            }
         }
     }
 
@@ -1150,11 +1169,66 @@ impl Reactor {
         }
     }
 
+    /// Adds a window that became visible to the layout of its space. Returns
+    /// the window if it was added to a space.
+    fn add_visible_window(&mut self, wid: WindowId) -> Option<WindowId> {
+        if !self.window_is_tracked(wid) {
+            return None;
+        }
+        let window = self.windows.get(&wid)?;
+        let space = self.best_space_for_window(&window.frame_monotonic);
+        let info = self.layout_window_info(wid)?;
+        match space {
+            Some(space) => {
+                self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
+                Some(wid)
+            }
+            None => {
+                self.send_layout_event(LayoutEvent::ScratchpadCandidates(vec![(wid, info)]));
+                None
+            }
+        }
+    }
+
+    /// Starts moving a window that just opened to the desktop of the first
+    /// window rule it matches, if that rule has a `space` and the window is
+    /// on another desktop.
+    fn move_to_rule_desktop(&mut self, wid: WindowId) {
+        if !self.startup_complete || self.pending_rule_moves.contains_key(&wid) {
+            return;
+        }
+        let Some(info) = self.layout_window_info(wid) else {
+            return;
+        };
+        let Some(desktop) = self.layout.rule_space(&info) else {
+            return;
+        };
+        let Some(wsid) = self.windows.get(&wid).and_then(|w| w.window_server_id) else {
+            debug!(?wid, desktop, "Not moving window without a window server id");
+            return;
+        };
+        let id = SpaceMoveId(self.next_space_move_id);
+        self.next_space_move_id += 1;
+        match self.system.move_window_to_desktop(wid, wsid, desktop, id) {
+            Ok(()) => {
+                info!(?wid, desktop, ?id, "Moving window to its desktop");
+                self.pending_rule_moves.insert(wid, id);
+            }
+            Err(err) => {
+                debug!(?wid, desktop, "Not moving window to its desktop: {err}");
+                // A replay does not try the move, so it needs the outcome in
+                // the trace to make the same decision.
+                self.record.on_event(&Event::ScratchpadMoveEnded(id));
+            }
+        }
+    }
+
     fn on_windows_discovered(
         &mut self,
         pid: pid_t,
         new: Vec<(WindowId, WindowInfo)>,
         _known_visible: Vec<WindowId>,
+        apply_space_rules: bool,
     ) {
         // Note that we rely on the window server info, not accessibility, to
         // tell us which windows are visible.
@@ -1174,7 +1248,13 @@ impl Reactor {
         // undiscovered windows.
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
+        let new_wids: Vec<WindowId> = new.iter().map(|(wid, _)| *wid).collect();
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
+        if apply_space_rules {
+            for wid in new_wids {
+                self.move_to_rule_desktop(wid);
+            }
+        }
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
         // The layout takes the first matching window as a scratchpad: prefer
         // the main window, then visible windows, wherever they are.
@@ -1200,6 +1280,7 @@ impl Reactor {
             .flat_map(|wsid| self.window_ids.get(wsid).copied())
             .filter(|wid| wid.pid == pid)
             .filter(|wid| self.window_is_tracked(*wid))
+            .filter(|wid| !self.pending_rule_moves.contains_key(wid))
             .collect::<BTreeSet<_>>();
         for wid in wids {
             let Some(window) = self.windows.get(&wid) else { continue };
@@ -1823,6 +1904,7 @@ pub mod tests {
 
         fn rule(app_id: &str, name: &str, frame: Option<FractionalRect>) -> WindowRule {
             WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some(app_id.into()),
                     ..Default::default()
@@ -1856,6 +1938,9 @@ pub mod tests {
             moves: Arc<Mutex<Vec<(WindowId, SpaceId, SpaceMoveId)>>>,
             moves_unsupported: Arc<Mutex<bool>>,
             launches_fail: Arc<Mutex<bool>>,
+            desktop_moves: Arc<Mutex<Vec<(WindowId, u32, SpaceMoveId)>>>,
+            /// The desktop the windows are on; moving there fails.
+            current_desktop: Arc<Mutex<u32>>,
         }
 
         impl SystemActions for FakeSystem {
@@ -1886,6 +1971,21 @@ pub mod tests {
                     return Err(crate::sys::space_move::SpaceMoveError::Unsupported);
                 }
                 self.moves.lock().unwrap().push((wid, space, id));
+                Ok(())
+            }
+
+            fn move_window_to_desktop(
+                &mut self,
+                wid: WindowId,
+                wsid: WindowServerId,
+                desktop: u32,
+                id: SpaceMoveId,
+            ) -> Result<(), crate::sys::space_move::SpaceMoveError> {
+                assert!(wsid.as_u32() > 0);
+                if desktop == *self.current_desktop.lock().unwrap() {
+                    return Err(crate::sys::space_move::SpaceMoveError::AlreadyOnSpace);
+                }
+                self.desktop_moves.lock().unwrap().push((wid, desktop, id));
                 Ok(())
             }
         }
@@ -1994,6 +2094,19 @@ pub mod tests {
                 self.system.moves.lock().unwrap().clone()
             }
 
+            fn desktop_moves(&self) -> Vec<(WindowId, u32)> {
+                let moves = self.system.desktop_moves.lock().unwrap();
+                moves.iter().map(|&(wid, desktop, _)| (wid, desktop)).collect()
+            }
+
+            fn last_desktop_move_id(&self) -> SpaceMoveId {
+                self.system.desktop_moves.lock().unwrap().last().expect("a desktop move").2
+            }
+
+            fn tiled_frame(&self) -> CGRect {
+                self.reactor.windows[&tiled()].frame_monotonic
+            }
+
             fn set_screen_spaces(&mut self, spaces: Vec<Option<ScreenSpace>>) {
                 self.reactor.handle_event(Event::ScreenSpacesChanged(spaces));
             }
@@ -2004,6 +2117,92 @@ pub mod tests {
                 self.settle();
                 assert!(self.reactor.is_app_hidden(2));
             }
+        }
+
+        fn space_rule(app_id: &str, space: u32) -> WindowRule {
+            WindowRule {
+                conditions: WindowRuleConditions {
+                    app_id: Some(app_id.into()),
+                    ..Default::default()
+                },
+                float: None,
+                scratchpad: None,
+                frame: None,
+                space: Some(space),
+            }
+        }
+
+        #[test]
+        fn space_rule_window_of_a_launched_app_is_moved_and_not_tiled_here() {
+            let mut t = Test::with_rules(vec![space_rule("com.testapp3", 2)]);
+            let tiled_frame = t.tiled_frame();
+            t.launch(3, vec![make_window(7)], false);
+            t.settle();
+            assert_eq!(t.desktop_moves(), [(launched_pad(), 2)]);
+            assert_eq!(t.tiled_frame(), tiled_frame, "no window was added");
+
+            // The move took the window off screen.
+            t.update_on_screen(|wsid| wsid != WindowServerId::new(7));
+            let id = t.last_desktop_move_id();
+            t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+            t.settle();
+            assert_eq!(t.tiled_frame(), tiled_frame);
+            assert!(t.reactor.pending_rule_moves.is_empty());
+        }
+
+        #[test]
+        fn space_rule_window_still_here_when_the_move_ends_is_tiled() {
+            let mut t = Test::with_rules(vec![space_rule("com.testapp3", 2)]);
+            let tiled_frame = t.tiled_frame();
+            t.launch(3, vec![make_window(7)], false);
+            t.settle();
+            let id = t.last_desktop_move_id();
+            t.reactor.handle_event(Event::ScratchpadMoveEnded(id));
+            t.settle();
+            assert_ne!(t.tiled_frame(), tiled_frame, "the window was added");
+        }
+
+        #[test]
+        fn space_rule_window_on_its_desktop_already_is_tiled() {
+            let mut t = Test::with_rules(vec![space_rule("com.testapp3", 1)]);
+            *t.system.current_desktop.lock().unwrap() = 1;
+            let tiled_frame = t.tiled_frame();
+            t.launch(3, vec![make_window(7)], false);
+            t.settle();
+            assert!(t.desktop_moves().is_empty());
+            assert_ne!(t.tiled_frame(), tiled_frame, "the window was added");
+        }
+
+        #[test]
+        fn space_rule_window_created_after_launch_is_moved() {
+            let mut t = Test::with_rules(vec![space_rule("com.testapp3", 3)]);
+            t.launch(3, vec![], false);
+            t.settle();
+            let tiled_frame = t.tiled_frame();
+            let window = make_window(7);
+            t.windows.push((3, window.clone()));
+            t.reactor
+                .handle_event(Event::WindowCreated(launched_pad(), window, MouseState::Up));
+            t.update_on_screen(|_| true);
+            t.reactor.handle_event(Event::WindowBecameVisible(launched_pad()));
+            t.settle();
+            assert_eq!(t.desktop_moves(), [(launched_pad(), 3)]);
+            assert_eq!(t.tiled_frame(), tiled_frame, "no window was added");
+        }
+
+        #[test]
+        fn space_rule_windows_open_at_startup_are_not_moved() {
+            let t = Test::with_rules(vec![space_rule("com.testapp2", 2)]);
+            assert!(t.desktop_moves().is_empty());
+        }
+
+        #[test]
+        fn space_rule_closed_window_is_no_longer_pending() {
+            let mut t = Test::with_rules(vec![space_rule("com.testapp3", 2)]);
+            t.launch(3, vec![make_window(7)], false);
+            t.settle();
+            t.reactor.handle_event(Event::WindowDestroyed(launched_pad()));
+            assert!(t.reactor.pending_rule_moves.is_empty());
         }
 
         fn has_frame(requests: &[(pid_t, Request)], wid: WindowId, frame: CGRect) -> bool {
@@ -3209,6 +3408,7 @@ pub mod tests {
             #[test]
             fn first_matching_rule_decides_the_scratchpad() {
                 let float = WindowRule {
+                    space: None,
                     conditions: WindowRuleConditions {
                         app_id: Some("com.testapp2".into()),
                         ..Default::default()
@@ -5518,8 +5718,8 @@ pub mod tests {
             space: Some(SpaceId::new(1)),
             scale_factor: 2.0,
         }];
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
         reactor.windows.insert(
             w1,
             super::WindowState {
@@ -5583,8 +5783,8 @@ pub mod tests {
     #[test]
     fn filter_response_keeps_response_when_focus_is_not_frontmost() {
         let reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
 
         let response = reactor.filter_response(
             layout::EventResponse {

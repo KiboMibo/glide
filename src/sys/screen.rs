@@ -348,6 +348,47 @@ pub fn get_active_space_number() -> Option<usize> {
     None
 }
 
+/// Returns the desktops of all displays in Mission Control order: the spaces
+/// that are not fullscreen apps. Desktop number `n` is element `n - 1`.
+///
+/// Note: This relies on private APIs and might break.
+pub fn desktop_spaces() -> Vec<SpaceId> {
+    /// The `type` of a space that is a desktop rather than a fullscreen app.
+    const DESKTOP_SPACE_TYPE: u64 = 0;
+    let cid = unsafe { CGSMainConnectionID() };
+    let Some(space_info) = (unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid)) }) else {
+        return vec![];
+    };
+    let mut desktops = vec![];
+    for screen in space_info {
+        let Some(spaces) = (|| {
+            let screen: Retained<NSDictionary> = screen.downcast().ok()?;
+            let spaces: Retained<NSArray> =
+                screen.valueForKey(ns_string!("Spaces"))?.downcast().ok()?;
+            Some(spaces)
+        })() else {
+            continue;
+        };
+        for space in spaces {
+            let Some(id) = (|| {
+                let space: Retained<NSDictionary> = space.downcast().ok()?;
+                let ty: Retained<NSNumber> =
+                    space.valueForKey(ns_string!("type"))?.downcast().ok()?;
+                if ty.as_u64() != DESKTOP_SPACE_TYPE {
+                    return None;
+                }
+                let id: Retained<NSNumber> =
+                    space.valueForKey(ns_string!("ManagedSpaceID"))?.downcast().ok()?;
+                SpaceId::from_raw(id.as_u64())
+            })() else {
+                continue;
+            };
+            desktops.push(id);
+        }
+    }
+    desktops
+}
+
 /// Utilities for querying the current system configuration. For diagnostic purposes only.
 #[allow(dead_code)]
 pub mod diagnostic {

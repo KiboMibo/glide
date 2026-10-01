@@ -30,6 +30,12 @@ glide launch
 
 _Note:_ If you don't have Homebrew, see the "manual installation" section below.
 
+> [!NOTE]
+> This is the KiboMibo fork of Glide. To install the fork, with its scratchpad
+> windows, trackpad scrolling and desktop assignment, use its tap instead:
+> `brew install --cask KiboMibo/tap/glide-kibo`. Fork builds are signed ad hoc
+> and update with `brew upgrade --cask glide-kibo`.
+
 The first time you do this, you will have to follow instructions to enable
 Accessibility permissions.
 
@@ -66,15 +72,19 @@ To exit Glide, type ⌥⇧E.
 
 ### Save and restore
 
-If you need to update Glide or restart it for any reason, exit with the
-`save_and_exit` key binding (default ⌥⇧E). Then, when starting again,
-run it with the `--restore` flag:
+When you exit Glide with the `save_and_exit` key binding (default ⌥⇧E) or
+the Quit menu item, it saves your layout and which spaces are enabled. The next
+time Glide starts in the same login session, it restores them. To start with a
+fresh layout instead, run:
 
 ```
-glide launch --restore
+glide launch --no-restore
 ```
 
-Note that this does not work across machine restarts.
+To start fresh by default, set `auto_restore = false` under `[settings]` in your
+config. `glide launch --restore` then restores for that launch.
+
+Saved state is not restored after logging out or restarting your machine.
 
 ### Running Glide at login
 
@@ -123,6 +133,34 @@ Some limitations:
   you have not visited since, macOS switches to that desktop instead.
 
 See `scratchpad` and `toggle_scratchpad` in [glide.default.toml] for details.
+
+### Assigning apps to desktops
+
+To open an app's windows on a particular desktop, add a window rule with
+`space`, the number of the desktop in Mission Control counting from 1:
+
+```toml
+[[window_rules]]
+if.app_id = "ru.keepcoder.Telegram"
+space = 3
+
+[[window_rules]]
+if.app_name = "Slack"
+space = 2
+float = true  # optional; `float` and `space` combine
+```
+
+When a matching window opens, Glide moves it to that desktop; it shows up in
+the layout there the next time you switch to it. Some details:
+
+- Desktops are numbered across all displays in Mission Control order, and
+  fullscreen apps are not counted.
+- Only windows that open while Glide is running are moved. Windows that are
+  already open when Glide starts stay where they are.
+- Only standard windows are moved, so dialogs and panels stay with the window
+  that opened them.
+- Moving windows between desktops requires macOS 26 or later. If the desktop
+  does not exist or the move fails, the window stays on the current desktop.
 
 ## Manual installation
 

@@ -16,7 +16,7 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSData, NSObject, NSString, ns_string};
 use tracing::{Span, debug, error, warn};
 
-use crate::actor::reactor;
+use crate::actor::updater;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
 use crate::config;
 
@@ -24,6 +24,7 @@ const SAVE_AND_QUIT_TAG: i64 = 1;
 const TOGGLE_GLOBAL_TAG: i64 = 2;
 const TOGGLE_SPACE_TAG: i64 = 3;
 const SHOW_DOCS_TAG: i64 = 4;
+const INSTALL_UPDATE_TAG: i64 = 5;
 
 pub struct StatusIcon {
     status_item: Retained<NSStatusItem>,
@@ -31,6 +32,7 @@ pub struct StatusIcon {
     _menu_handler: Retained<MenuHandler>,
     toggle_item: Retained<NSMenuItem>,
     space_toggle_item: Retained<NSMenuItem>,
+    update_item: Retained<NSMenuItem>,
 }
 
 impl StatusIcon {
@@ -39,6 +41,7 @@ impl StatusIcon {
         config: &config::StatusIconExperimental,
         mtm: MainThreadMarker,
         wm_tx: wm_controller::Sender,
+        updater_tx: updater::Sender,
     ) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -55,7 +58,7 @@ impl StatusIcon {
         // This is needed to be able to manually set the menu item state
         menu.setAutoenablesItems(false);
 
-        let menu_handler = MenuHandler::new(mtm, wm_tx);
+        let menu_handler = MenuHandler::new(mtm, wm_tx, updater_tx);
 
         let space_toggle_ns_title = ns_string!("Enable Space");
         let space_toggle_item = unsafe {
@@ -82,6 +85,19 @@ impl StatusIcon {
         };
         version_item.setEnabled(false);
         menu.addItem(&version_item);
+
+        let update_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!(""),
+                Some(sel!(handleAction:)),
+                ns_string!(""),
+            )
+        };
+        unsafe { update_item.setTarget(Some(&*menu_handler)) };
+        update_item.setTag(INSTALL_UPDATE_TAG as isize);
+        update_item.setHidden(true);
+        menu.addItem(&update_item);
 
         let docs_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -130,6 +146,7 @@ impl StatusIcon {
             _menu_handler: menu_handler,
             toggle_item,
             space_toggle_item,
+            update_item,
         }
     }
 
@@ -155,6 +172,18 @@ impl StatusIcon {
         self.space_toggle_item.setTitle(&ns_title);
     }
 
+    /// Show the update menu item with `title`, or hide it if `None`.
+    pub fn set_update_item(&mut self, title: Option<&str>, enabled: bool) {
+        match title {
+            Some(title) => {
+                self.update_item.setTitle(&NSString::from_str(title));
+                self.update_item.setEnabled(enabled);
+                self.update_item.setHidden(false);
+            }
+            None => self.update_item.setHidden(true),
+        }
+    }
+
     /// Sets whether the space toggle menu item is enabled.
     pub fn set_space_toggle_enabled(&mut self, enabled: bool) {
         self.space_toggle_item.setEnabled(enabled);
@@ -171,6 +200,7 @@ impl Drop for StatusIcon {
 
 struct MenuHandlerIvars {
     wm_tx: wm_controller::Sender,
+    updater_tx: updater::Sender,
 }
 
 define_class!(
@@ -193,9 +223,7 @@ define_class!(
                     debug!("Sending SaveAndExit command");
                     let _ = wm_tx.send((
                         Span::current(),
-                        WmEvent::Command(WmCommand::ReactorCommand(
-                            reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit),
-                        )),
+                        WmEvent::Command(WmCommand::Wm(WmCmd::SaveAndExit)),
                     ));
                 }
                 TOGGLE_GLOBAL_TAG => {
@@ -211,6 +239,12 @@ define_class!(
                         Span::current(),
                         WmEvent::Command(WmCommand::Wm(WmCmd::ToggleSpaceActivated)),
                     ));
+                }
+                INSTALL_UPDATE_TAG => {
+                    debug!("Requesting update install");
+                    if self.ivars().updater_tx.send(updater::Request::Install).is_err() {
+                        error!("Updater is not running");
+                    }
                 }
                 SHOW_DOCS_TAG => {
                     debug!("Opening docs in browser");
@@ -231,9 +265,13 @@ define_class!(
 
 impl MenuHandler {
     /// Creates the parachute icon from the SVG file
-    pub fn new(mtm: MainThreadMarker, wm_tx: wm_controller::Sender) -> Retained<Self> {
+    pub fn new(
+        mtm: MainThreadMarker,
+        wm_tx: wm_controller::Sender,
+        updater_tx: updater::Sender,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm);
-        let this = this.set_ivars(MenuHandlerIvars { wm_tx });
+        let this = this.set_ivars(MenuHandlerIvars { wm_tx, updater_tx });
         unsafe { msg_send![super(this), init] }
     }
 }

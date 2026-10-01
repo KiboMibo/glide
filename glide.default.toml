@@ -10,6 +10,10 @@ animate = true
 # toggle_space_activated command to enable a space.
 default_disable = true
 
+# Restore the layout and enabled spaces saved when Glide last exited in the
+# same login session. The --restore and --no-restore launch flags override this.
+auto_restore = true
+
 # Focus the window under the mouse as it moves.
 focus_follows_mouse = true
 
@@ -113,7 +117,7 @@ default_keys = false
 
 # Toggle the parent container between horizontal and vertical, or between
 # tabbed and stacked.
-"Alt + Slash" = "toggle_orientation"
+# "<key>" = "toggle_orientation"
 
 # Change the parent node to a horizontal or vertical group, also known as
 # "tabbed" and "stacked" respectively. Groups show one window at a time,
@@ -262,8 +266,8 @@ scroll.single_column_aspect_ratio = ""
 
 # Per-app/window rules overriding how windows are managed when first observed.
 #
-# Each rule nests its conditions under `if` and carries a `float` and/or
-# `scratchpad` action. All
+# Each rule nests its conditions under `if` and carries a `float`, `scratchpad`
+# and/or `space` action. All
 # specified conditions must match (logical AND); omitted conditions are ignored.
 # Rules are evaluated in order and the first match wins. A matching rule
 # overrides Glide's built-in floating heuristics.
@@ -276,7 +280,7 @@ scroll.single_column_aspect_ratio = ""
 #   ax_role         - Accessibility AXRole (e.g. "AXWindow")
 #   ax_subrole      - Accessibility AXSubrole (e.g. "AXDialog")
 #
-# Actions (at least one of `float` and `scratchpad` is required):
+# Actions (at least one of `float`, `scratchpad` and `space` is required):
 #   float           - true to float matching windows, false to tile them
 #   scratchpad      - name of a scratchpad; matching windows always float and
 #                     are shown and hidden with the `toggle_scratchpad` command
@@ -285,6 +289,13 @@ scroll.single_column_aspect_ratio = ""
 #   frame           - frame of a scratchpad window as fractions of the active
 #                     screen, e.g. { x = 0.1, y = 0.1, width = 0.8, height = 0.8 }
 #                     (the default); requires `scratchpad`
+#   space           - number of the desktop (counting from 1) to move matching
+#                     windows to when they open. Desktops are numbered across
+#                     all displays in Mission Control order, not counting
+#                     fullscreen apps. Only standard windows that open while
+#                     Glide is running are moved; a rule with only `space`
+#                     keeps the built-in floating heuristics. Cannot be
+#                     combined with `scratchpad`. Requires macOS 26 or later
 #
 # Scratchpad limitations:
 #   - One window per name. Only one matching window becomes the scratchpad
@@ -321,3 +332,7 @@ scroll.single_column_aspect_ratio = ""
 #   if.app_id = "com.artemchep.keyguard"
 #   scratchpad = "keyguard"
 #   frame = { x = 0.2, y = 0.1, width = 0.6, height = 0.8 }
+#
+#   [[window_rules]]
+#   if.app_id = "ru.keepcoder.Telegram"
+#   space = 3

@@ -22,6 +22,10 @@ pub enum SpaceMoveError {
     Unsupported,
     #[error("the window server does not list the window as owned by the app")]
     NotOwned,
+    #[error("there is no desktop {0}")]
+    NoSuchDesktop(u32),
+    #[error("the window is already on the desktop")]
+    AlreadyOnSpace,
 }
 
 /// Asks the window server to move a window to a space.

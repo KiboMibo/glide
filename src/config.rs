@@ -30,8 +30,13 @@ pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
 }
 
+/// The layout saved by versions of Glide before [`saved_state_file`].
 pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
+}
+
+pub fn saved_state_file() -> PathBuf {
+    data_dir().join("state.ron")
 }
 
 pub fn config_path() -> PathBuf {
@@ -92,6 +97,7 @@ enum Disabled {
 pub struct Settings {
     pub animate: bool,
     pub default_disable: bool,
+    pub auto_restore: bool,
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,
@@ -169,12 +175,24 @@ pub struct WindowRule {
     /// Frame of the scratchpad window as fractions of the active screen.
     #[serde(default)]
     pub frame: Option<FractionalRect>,
+    /// Number of the desktop (Mission Control space, counting from 1) that
+    /// matching windows are moved to when they open.
+    #[serde(default)]
+    pub space: Option<u32>,
 }
 
 impl WindowRule {
     pub(crate) fn validated(mut self) -> Result<Self, String> {
+        if self.space == Some(0) {
+            return Err("window rule `space` counts from 1".into());
+        }
+        if self.space.is_some() && self.scratchpad.is_some() {
+            return Err("window rule cannot combine `space` with `scratchpad`".into());
+        }
         match (&self.scratchpad, self.float) {
-            (None, None) => return Err("window rule needs `float` or `scratchpad`".into()),
+            (None, None) if self.space.is_none() => {
+                return Err("window rule needs `float`, `scratchpad` or `space`".into());
+            }
             (Some(name), _) if name.trim().is_empty() => {
                 return Err("window rule `scratchpad` must not be empty".into());
             }
@@ -679,6 +697,7 @@ mod tests {
             config.window_rules,
             vec![
                 WindowRule {
+                    space: None,
                     conditions: WindowRuleConditions {
                         app_id: Some("com.example.X".into()),
                         title_regex: Some("Dialog".parse().unwrap()),
@@ -689,6 +708,7 @@ mod tests {
                     frame: None,
                 },
                 WindowRule {
+                    space: None,
                     conditions: WindowRuleConditions {
                         title_substring: Some("Preferences".into()),
                         ax_subrole: Some("AXDialog".into()),
@@ -716,6 +736,7 @@ mod tests {
         assert_eq!(
             config.window_rules,
             vec![WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
@@ -762,6 +783,7 @@ mod tests {
             config.window_rules,
             vec![
                 WindowRule {
+                    space: None,
                     conditions: WindowRuleConditions {
                         app_id: Some("com.example.keyguard".into()),
                         ..Default::default()
@@ -776,6 +798,7 @@ mod tests {
                     }),
                 },
                 WindowRule {
+                    space: None,
                     conditions: WindowRuleConditions {
                         app_id: Some("com.example.X".into()),
                         ..Default::default()
@@ -800,7 +823,32 @@ mod tests {
 
     #[test]
     fn window_rule_without_action_is_rejected() {
-        assert_rule_rejected(r#"if.app_id = "com.example.X""#, "needs `float` or `scratchpad`");
+        assert_rule_rejected(
+            r#"if.app_id = "com.example.X""#,
+            "needs `float`, `scratchpad` or `space`",
+        );
+    }
+
+    #[test]
+    fn space_rule_parses_without_float() {
+        let rule = parse_single_rule("if.app_id = \"org.telegram.desktop\"\nspace = 3");
+        assert_eq!(rule.space, Some(3));
+        assert_eq!(rule.float, None);
+        let rule = parse_single_rule("float = true\nspace = 2");
+        assert_eq!((rule.float, rule.space), (Some(true), Some(2)));
+    }
+
+    #[test]
+    fn space_zero_is_rejected() {
+        assert_rule_rejected("space = 0", "`space` counts from 1");
+    }
+
+    #[test]
+    fn space_with_scratchpad_is_rejected() {
+        assert_rule_rejected(
+            "scratchpad = \"k\"\nspace = 2",
+            "cannot combine `space` with `scratchpad`",
+        );
     }
 
     #[test]
@@ -838,6 +886,7 @@ mod tests {
         assert_eq!(
             config.window_rules,
             vec![WindowRule {
+                space: None,
                 conditions: WindowRuleConditions::default(),
                 float: None,
                 scratchpad: Some("k".into()),
@@ -1201,6 +1250,7 @@ mod tests {
         assert_eq!(
             scratchpad_rules,
             [&WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some("com.artemchep.keyguard".into()),
                     ..Default::default()

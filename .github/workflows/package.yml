@@ -16,6 +16,8 @@ env:
 
 jobs:
   package:
+    # Signing needs the upstream secrets; fork releases come from build.yml.
+    if: github.repository == 'glide-wm/glide'
     environment: packaging
     runs-on: macos-15
     permissions:
@@ -103,20 +105,55 @@ jobs:
         run: |
           codesign -v target/*-apple-darwin/release/Glide_*.dmg
 
+      # Glide's self-updater downloads these instead of the disk images.
+      - name: Archive app bundles
+        run: |
+          for dmg in target/*-apple-darwin/release/Glide_*.dmg; do
+            ditto -c -k --keepParent "$(dirname "$dmg")/Glide.app" "${dmg%.dmg}.app.zip"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
-          path: target/*-apple-darwin/release/Glide_*.dmg
+          path: |
+            target/*-apple-darwin/release/Glide_*.dmg
+            target/*-apple-darwin/release/Glide_*.app.zip
 
-      - name: Release
+      # release-please creates the draft release before this workflow runs.
+      # Keep it as a draft until its assets and final changelog body are ready.
+      - name: Upload release assets
+        id: release
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
         with:
           files: |
             target/aarch64-apple-darwin/release/Glide_*.dmg
             target/x86_64-apple-darwin/release/Glide_*.dmg
+            target/aarch64-apple-darwin/release/Glide_*.app.zip
+            target/x86_64-apple-darwin/release/Glide_*.app.zip
           fail_on_unmatched_files: true
-          body_path: CHANGELOG_version.md
-          # To keep release-please's notes, comment the line above and uncomment
-          # these lines:
-          # body: ""
-          # append_body: true
+          draft: true
+
+      # Use the release ID returned above instead of looking it up by tag. Draft
+      # releases are not always discoverable by tag, which can cause release
+      # actions to create and then discard a duplicate with the desired body.
+      - name: Publish release with changelog notes
+        if: github.ref_type == 'tag'
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const releaseId = Number(process.env.RELEASE_ID);
+            if (!Number.isSafeInteger(releaseId)) {
+              core.setFailed(`Invalid release ID: ${process.env.RELEASE_ID}`);
+              return;
+            }
+
+            const body = fs.readFileSync("CHANGELOG_version.md", "utf8");
+            await github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: releaseId,
+              body,
+              draft: false,
+            });
