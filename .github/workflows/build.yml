@@ -1,0 +1,57 @@
+name: Build
+
+# Builds an unsigned Glide.app for testing a branch. Unlike the Package
+# workflow, this needs no signing secrets: the app is signed ad hoc, so macOS
+# asks to confirm opening it the first time.
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  app:
+    name: Build app bundle
+    runs-on: macos-15
+    steps:
+      - name: Install cargo-packager
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install latest stable
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Package and sign ad hoc
+        run: |
+          # The release signing identity is not available here.
+          sed -i '' '/^macos.signingIdentity/d' Cargo.toml
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo packager --release --target "$target" --formats app
+            app="target/$target/release/Glide.app"
+            codesign --force --deep --sign - "$app"
+            codesign -v "$app"
+            ditto -c -k --keepParent "$app" "Glide-$target.app.zip"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glide-${{ github.sha }}
+          path: Glide-*.app.zip
