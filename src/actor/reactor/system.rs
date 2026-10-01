@@ -239,6 +239,7 @@ impl Deadlines {
         self.0.values().map(|(at, _)| *at).min()
     }
 
+    /// Removes the events whose deadline has passed, earliest deadline first.
     fn take_due(&mut self, now: Instant) -> Vec<Event> {
         let due: Vec<DelayKey> = self
             .0
@@ -246,10 +247,10 @@ impl Deadlines {
             .filter(|(_, (at, _))| *at <= now)
             .map(|(key, _)| key.clone())
             .collect();
-        due.into_iter()
-            .filter_map(|key| self.0.remove(&key))
-            .map(|(_, event)| event)
-            .collect()
+        let mut events: Vec<(Instant, Event)> =
+            due.into_iter().filter_map(|key| self.0.remove(&key)).collect();
+        events.sort_by_key(|(at, _)| *at);
+        events.into_iter().map(|(_, event)| event).collect()
     }
 }
 
@@ -327,7 +328,8 @@ mod tests {
         assert!(deadlines.take_due(start + Duration::from_millis(49)).is_empty());
         assert_eq!(
             super::tests::ids(&deadlines.take_due(start + Duration::from_millis(109))),
-            [ids[99], ids[100]]
+            [ids[100], ids[99]],
+            "earliest deadline first"
         );
         assert_eq!(deadlines.next(), None);
         assert!(deadlines.take_due(start + Duration::from_secs(60)).is_empty());
