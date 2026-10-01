@@ -30,8 +30,13 @@ pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
 }
 
+/// The layout saved by versions of Glide before [`saved_state_file`].
 pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
+}
+
+pub fn saved_state_file() -> PathBuf {
+    data_dir().join("state.ron")
 }
 
 pub fn config_path() -> PathBuf {
@@ -92,6 +97,7 @@ enum Disabled {
 pub struct Settings {
     pub animate: bool,
     pub default_disable: bool,
+    pub auto_restore: bool,
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,

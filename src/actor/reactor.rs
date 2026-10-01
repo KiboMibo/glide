@@ -37,7 +37,8 @@ use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
 use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
-use crate::actor::space_manager::SpaceManager;
+use crate::actor::saved_state::SavedState;
+use crate::actor::space_manager::{SpaceManager, SpaceState};
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
 use crate::collections::{HashMap, HashSet};
 use crate::config::{Config, ScrollModifier};
@@ -233,6 +234,9 @@ pub enum Event {
 
     Command(Command),
     ConfigChanged(Arc<Config>),
+
+    /// Save the state along with the space state, then exit.
+    SaveAndExit(SpaceState),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -271,7 +275,6 @@ pub enum Command {
 pub enum ReactorCommand {
     Debug,
     Serialize,
-    SaveAndExit,
     /// Shows or hides the scratchpad window with the given name.
     ToggleScratchpad {
         name: String,
@@ -472,6 +475,7 @@ impl Reactor {
         sm_tx: space_manager::Sender,
         sm_rx: space_manager::Receiver,
         skylight_tx: window_server::SkylightSender,
+        restored_spaces: Option<SpaceState>,
     ) {
         thread::Builder::new()
             .name("reactor".to_string())
@@ -493,6 +497,7 @@ impl Reactor {
                     status_tx,
                     group_indicators_tx,
                     mouse_tx,
+                    restored_spaces,
                 );
                 let window_server = window_server::WindowServer::new(sm_tx, wm_tx, skylight_tx);
                 Executor::run(async move {
@@ -1060,19 +1065,10 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 println!("{}", self.layout.serialize_to_string());
             }
-            Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
-                info!("SaveAndExit command received");
-                match self.layout.save(crate::config::restore_file()) {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        error!("Could not save layout: {e}");
-                        std::process::exit(3);
-                    }
-                }
-            }
             Event::Command(Command::Reactor(ReactorCommand::ToggleScratchpad { name, launch })) => {
                 self.toggle_scratchpad(&name, launch.as_deref());
             }
+            Event::SaveAndExit(spaces) => self.save_and_exit(spaces),
             Event::ConfigChanged(config) => {
                 self.layout.set_config(&config);
                 self.config = config;
@@ -1091,6 +1087,17 @@ impl Reactor {
             self.update_layout(&animation_focus_wids, is_resize);
         } else if !self.layout.has_interactive_state() {
             self.interrupt_scroll_animation();
+        }
+    }
+
+    fn save_and_exit(&self, spaces: SpaceState) -> ! {
+        info!("SaveAndExit command received");
+        match SavedState::save(&self.layout, spaces, &crate::config::saved_state_file()) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                error!("Could not save state: {e}");
+                std::process::exit(3);
+            }
         }
     }
 
@@ -5518,8 +5525,8 @@ pub mod tests {
             space: Some(SpaceId::new(1)),
             scale_factor: 2.0,
         }];
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
         reactor.windows.insert(
             w1,
             super::WindowState {
@@ -5583,8 +5590,8 @@ pub mod tests {
     #[test]
     fn filter_response_keeps_response_when_focus_is_not_frontmost() {
         let reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
-        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1)).unwrap();
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2)).unwrap();
 
         let response = reactor.filter_response(
             layout::EventResponse {

@@ -5,9 +5,11 @@
 //! for SpaceChanged events before they get to the Reactor, removing disabled
 //! SpaceIds so that the Reactor does not manage them.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use objc2_core_foundation::CGRect;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
 use crate::actor::wm_controller::WmEvent;
@@ -42,6 +44,7 @@ pub enum Event {
     ExposeActive(bool),
     ReactorCommand(reactor::Command),
     ConfigUpdated(Arc<Config>),
+    SaveAndExit,
 }
 
 pub type Sender = crate::actor::Sender<Event>;
@@ -49,6 +52,14 @@ pub type Receiver = crate::actor::Receiver<Event>;
 
 pub fn channel() -> (Sender, Receiver) {
     crate::actor::channel()
+}
+
+/// Which spaces are enabled, saved across a relaunch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SpaceState {
+    pub enabled: BTreeSet<SpaceId>,
+    pub disabled: BTreeSet<SpaceId>,
+    pub globally_enabled: bool,
 }
 
 pub struct SpaceManager {
@@ -83,8 +94,14 @@ impl SpaceManager {
         status_tx: status::Sender,
         group_indicators_tx: group_bars::Sender,
         mouse_tx: mouse::Sender,
+        restored: Option<SpaceState>,
     ) -> Self {
-        let is_globally_enabled = true;
+        let restored = restored.unwrap_or(SpaceState {
+            enabled: BTreeSet::new(),
+            disabled: BTreeSet::new(),
+            globally_enabled: true,
+        });
+        let is_globally_enabled = restored.globally_enabled;
         status_tx.send(status::Event::GlobalEnabledChanged(is_globally_enabled));
         Self {
             one_space,
@@ -99,8 +116,8 @@ impl SpaceManager {
             cur_space: Vec::new(),
             cur_screen_id: Vec::new(),
             focused_screen: None,
-            disabled_spaces: HashSet::default(),
-            enabled_spaces: HashSet::default(),
+            disabled_spaces: restored.disabled.into_iter().collect(),
+            enabled_spaces: restored.enabled.into_iter().collect(),
             login_window_active: false,
             expose_active: false,
             is_globally_enabled,
@@ -191,6 +208,9 @@ impl SpaceManager {
             Event::ReactorCommand(cmd) => {
                 self.reactor_tx.send(reactor::Event::Command(cmd));
             }
+            Event::SaveAndExit => {
+                self.reactor_tx.send(reactor::Event::SaveAndExit(self.space_state()));
+            }
             Event::ConfigUpdated(config) => {
                 self.config = config.clone();
                 self.reactor_tx.send(reactor::Event::ConfigChanged(config));
@@ -200,6 +220,14 @@ impl SpaceManager {
                 self.send_space_enabled_status();
                 self.request_space_refresh();
             }
+        }
+    }
+
+    fn space_state(&self) -> SpaceState {
+        SpaceState {
+            enabled: self.enabled_spaces.iter().copied().collect(),
+            disabled: self.disabled_spaces.iter().copied().collect(),
+            globally_enabled: self.is_globally_enabled,
         }
     }
 
@@ -238,20 +266,25 @@ impl SpaceManager {
     }
 
     fn is_space_enabled(&self, space: SpaceId) -> bool {
-        match space {
-            sp if self.config.settings.default_disable => self.enabled_spaces.contains(&sp),
-            sp => !self.disabled_spaces.contains(&sp),
+        if self.disabled_spaces.contains(&space) {
+            false
+        } else if self.enabled_spaces.contains(&space) {
+            true
+        } else {
+            !self.config.settings.default_disable
         }
     }
 
     fn toggle_space(&mut self, space: SpaceId) {
-        let toggle_set = if self.config.settings.default_disable {
-            &mut self.enabled_spaces
-        } else {
-            &mut self.disabled_spaces
-        };
-        if !toggle_set.remove(&space) {
-            toggle_set.insert(space);
+        let enable = !self.is_space_enabled(space);
+        // Clear overrides left over from before default_disable changed, and
+        // record one only when it differs from the default.
+        self.enabled_spaces.remove(&space);
+        self.disabled_spaces.remove(&space);
+        match (enable, self.config.settings.default_disable) {
+            (true, true) => _ = self.enabled_spaces.insert(space),
+            (false, false) => _ = self.disabled_spaces.insert(space),
+            _ => {}
         }
         if !self.is_space_enabled(space) {
             self.group_indicators_tx.send(group_bars::Event::SpaceDisabled(space));
@@ -269,10 +302,8 @@ impl SpaceManager {
             let enabled = match space {
                 _ if self.login_window_active => false,
                 Some(_) if self.one_space && *space != self.starting_space => false,
-                Some(sp) if self.disabled_spaces.contains(sp) => false,
-                Some(sp) if self.enabled_spaces.contains(sp) => true,
-                _ if self.config.settings.default_disable => false,
-                _ => true,
+                Some(sp) => self.is_space_enabled(*sp),
+                None => !self.config.settings.default_disable,
             };
             if !enabled {
                 *space = None;
@@ -356,6 +387,10 @@ mod tests {
         }
 
         fn new_with(one_space: bool, config: Config) -> Self {
+            Self::new_restored(one_space, config, None)
+        }
+
+        fn new_restored(one_space: bool, config: Config, restored: Option<SpaceState>) -> Self {
             let (reactor_tx, reactor_rx) = actor::channel();
             let (ws_tx, ws_rx) = actor::channel();
             let (wm_tx, wm_rx) = mpsc::unbounded_channel();
@@ -371,6 +406,7 @@ mod tests {
                 status_tx,
                 group_bars_tx,
                 mouse_tx,
+                restored,
             );
             Self {
                 sm,
@@ -557,6 +593,70 @@ mod tests {
         h.send_space_changed(vec![Some(space(10))]);
         let events = drain(&mut h.reactor_rx);
         assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn save_and_exit_includes_space_state() {
+        let mut h = TestHarness::new();
+        h.setup_space(screen(1), space(10));
+        h.on_event(Event::ToggleSpace(screen(1)));
+        h.drain_all();
+
+        h.on_event(Event::SaveAndExit);
+        let events = drain(&mut h.reactor_rx);
+        let [reactor::Event::SaveAndExit(state)] = &events[..] else {
+            panic!("expected SaveAndExit, got {events:?}");
+        };
+        assert_eq!(state.enabled, [space(10)].into());
+        assert!(state.globally_enabled);
+    }
+
+    #[test]
+    fn restored_space_state_is_applied() {
+        let restored = SpaceState {
+            enabled: [space(10)].into(),
+            disabled: Default::default(),
+            globally_enabled: true,
+        };
+        let mut h = TestHarness::new_restored(false, Config::default(), Some(restored));
+        h.setup_space(screen(1), space(10));
+
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![Some(space(10))]);
+    }
+
+    #[test]
+    fn restored_global_disable_is_applied() {
+        let restored = SpaceState {
+            enabled: [space(10)].into(),
+            disabled: Default::default(),
+            globally_enabled: false,
+        };
+        let mut h = TestHarness::new_restored(false, Config::default(), Some(restored));
+        h.setup_space(screen(1), space(10));
+
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn toggle_enables_space_disabled_under_the_other_default() {
+        // Disabled while default_disable was false, now restored with it true.
+        let restored = SpaceState {
+            enabled: Default::default(),
+            disabled: [space(10)].into(),
+            globally_enabled: true,
+        };
+        let mut h = TestHarness::new_restored(false, Config::default(), Some(restored));
+        h.setup_space(screen(1), space(10));
+
+        h.on_event(Event::ToggleSpace(screen(1)));
+        h.drain_all();
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![Some(space(10))]);
     }
 
     #[test]

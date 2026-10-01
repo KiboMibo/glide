@@ -444,11 +444,8 @@ impl<'a, 'out> Visitor<'a, 'out> {
         use ContainerKind::*;
         match info.kind {
             Tabbed | Stacked => {
-                let (group_frame, indicator_frame) = if self.config.settings.group_bars.enable {
-                    size_with_group_indicator(rect, info.kind, &self.config.settings.group_bars)
-                } else {
-                    (rect, CGRect::ZERO)
-                };
+                let (group_frame, indicator_frame) =
+                    size_with_group_indicator(rect, info.kind, &self.config.settings.group_bars);
 
                 // Slightly janky visibility computation: If a node is fullscreen
                 // only its descendants can be considered visible. If multiple
@@ -477,7 +474,9 @@ impl<'a, 'out> Visitor<'a, 'out> {
                     );
                 }
 
-                if let Some(groups) = self.groups.as_deref_mut() {
+                if let Some(groups) = self.groups.as_deref_mut()
+                    && let Some(indicator_frame) = indicator_frame
+                {
                     groups.push(GroupBarInfo {
                         node_id: node,
                         container_kind: info.kind,
@@ -600,8 +599,12 @@ fn size_with_group_indicator(
     rect: CGRect,
     container_kind: ContainerKind,
     config: &crate::config::GroupBars,
-) -> (CGRect, CGRect) {
+) -> (CGRect, Option<CGRect>) {
     use crate::config::{HorizontalPlacement, VerticalPlacement};
+
+    if !config.enable {
+        return (rect, None);
+    }
 
     let thickness = config.thickness;
 
@@ -627,7 +630,7 @@ fn size_with_group_indicator(
                             height: thickness,
                         },
                     };
-                    (group_frame, indicator_frame)
+                    (group_frame, Some(indicator_frame))
                 }
                 HorizontalPlacement::Bottom => {
                     let group_frame = CGRect {
@@ -647,7 +650,7 @@ fn size_with_group_indicator(
                             height: thickness,
                         },
                     };
-                    (group_frame, indicator_frame)
+                    (group_frame, Some(indicator_frame))
                 }
             }
         }
@@ -672,7 +675,7 @@ fn size_with_group_indicator(
                             height: rect.size.height,
                         },
                     };
-                    (group_frame, indicator_frame)
+                    (group_frame, Some(indicator_frame))
                 }
                 VerticalPlacement::Right => {
                     let group_frame = CGRect {
@@ -692,11 +695,11 @@ fn size_with_group_indicator(
                             height: rect.size.height,
                         },
                     };
-                    (group_frame, indicator_frame)
+                    (group_frame, Some(indicator_frame))
                 }
             }
         }
-        _ => (rect, CGRect::ZERO),
+        _ => (rect, None),
     }
 }
 
@@ -926,14 +929,10 @@ mod tests {
         let (frames_enabled, groups_enabled) =
             tree.calculate_layout_and_groups(layout, screen, &config_enabled);
 
-        // Both should have same number of frames and groups
+        // Both should have same number of frames, but no groups when disabled.
         assert_eq!(frames_disabled.len(), frames_enabled.len());
-        assert_eq!(groups_disabled.len(), groups_enabled.len());
+        assert!(groups_disabled.is_empty());
         assert_eq!(groups_enabled.len(), 1);
-
-        // When disabled, indicator frame should be zero (no indicator to display)
-        let group_disabled = &groups_disabled[0];
-        assert_eq!(group_disabled.indicator_frame, rect(0, 0, 0, 0));
 
         // When enabled, indicator frame should be reserved space (top placement by default)
         let group_enabled = &groups_enabled[0];

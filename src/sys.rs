@@ -13,5 +13,6 @@ pub mod observer;
 pub mod run_loop;
 pub mod screen;
 pub mod space_move;
+pub mod session;
 pub mod timer;
 pub mod window_server;

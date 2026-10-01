@@ -129,13 +129,8 @@ impl GroupBars {
     }
 
     fn handle_groups_updated(&mut self, space_id: SpaceId, groups: Vec<GroupBarInfo>) {
-        let group_nodes: crate::collections::HashSet<NodeId> = groups
-            .iter()
-            // If indicators are disabled, we will get group info but the frames
-            // will be empty.
-            .filter(|g| !g.indicator_frame.is_empty())
-            .map(|g| g.node_id)
-            .collect();
+        let group_nodes: crate::collections::HashSet<NodeId> =
+            groups.iter().map(|g| g.node_id).collect();
         let space_indicators = self.indicators.entry(space_id).or_default();
         space_indicators.retain(|&node_id, _| group_nodes.contains(&node_id));
 

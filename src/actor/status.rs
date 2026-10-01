@@ -8,6 +8,7 @@ use std::sync::Arc;
 use objc2::MainThreadMarker;
 use tracing::instrument;
 
+use crate::actor::updater::{self, UpdateStatus};
 use crate::actor::wm_controller;
 use crate::config::Config;
 use crate::sys::screen::{SpaceId, get_active_space_number};
@@ -23,6 +24,7 @@ pub enum Event {
     GlobalEnabledChanged(bool),
     SpaceEnabledChanged(bool),
     ConfigUpdated(Arc<Config>),
+    UpdateStatusChanged(Option<UpdateStatus>),
 }
 
 pub struct Status {
@@ -31,6 +33,8 @@ pub struct Status {
     icon: Option<StatusIcon>,
     mtm: MainThreadMarker,
     wm_tx: wm_controller::Sender,
+    updater_tx: updater::Sender,
+    update_status: Option<UpdateStatus>,
 }
 
 pub type Sender = actor::Sender<Event>;
@@ -42,6 +46,7 @@ impl Status {
         rx: Receiver,
         mtm: MainThreadMarker,
         wm_tx: wm_controller::Sender,
+        updater_tx: updater::Sender,
     ) -> Self {
         let mut this = Self {
             icon: None,
@@ -49,6 +54,8 @@ impl Status {
             rx,
             mtm,
             wm_tx,
+            updater_tx,
+            update_status: None,
         };
         this.apply_config();
         this.update_toggle_title(true);
@@ -63,10 +70,12 @@ impl Status {
                     &self.config.settings.experimental.status_icon,
                     self.mtm,
                     self.wm_tx.clone(),
+                    self.updater_tx.clone(),
                 ))
             });
         }
         self.update_space();
+        self.show_update_status();
     }
 
     pub async fn run(mut self) {
@@ -95,6 +104,25 @@ impl Status {
                 self.config = config;
                 self.apply_config();
             }
+            Event::UpdateStatusChanged(status) => {
+                self.update_status = status;
+                self.show_update_status();
+            }
+        }
+    }
+
+    fn show_update_status(&mut self) {
+        let Some(icon) = &mut self.icon else { return };
+        match &self.update_status {
+            None => icon.set_update_item(None, false),
+            Some(UpdateStatus::Available(v)) => {
+                icon.set_update_item(Some(&format!("Update to Glide v{v}…")), true)
+            }
+            Some(UpdateStatus::Installing(v)) => {
+                icon.set_update_item(Some(&format!("Installing Glide v{v}…")), false)
+            }
+            Some(UpdateStatus::Failed(v)) => icon
+                .set_update_item(Some(&format!("Update to Glide v{v} failed; try again…")), true),
         }
     }
 
