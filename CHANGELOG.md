@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.16-kibo.1](https://github.com/KiboMibo/glide/compare/v0.2.15-kibo.2...v0.2.16-kibo.1) (2026-10-01)
+
+Fork release on top of Glide 0.2.16. Brings in everything from upstream 0.2.16
+(layout restored on relaunch, `glide version`, `toggle_orientation`, the macOS 27
+crash fix) and adds desktop assignment for apps. See "Assigning apps to desktops"
+in the README.
+
+### Features
+
+* Move an app's windows to a desktop when they open with `space = N` in a window rule ([#1](https://github.com/KiboMibo/glide/pull/1))
+* Install with Homebrew: `brew install --cask KiboMibo/tap/glide-kibo`
+
+### Bug Fixes
+
+* Send delayed events that fall due in the same tick in deadline order ([5ccbaf8](https://github.com/KiboMibo/glide/commit/5ccbaf8))
+
+### Notes
+
+* The builds are ad-hoc signed and not notarized. The self-updater added in
+  0.2.16 only installs official releases, so it stays off in fork builds;
+  update with `brew upgrade --cask glide-kibo` instead.
+
 ## [0.2.16](https://github.com/tmandry/glide/compare/v0.2.15...v0.2.16) (2026-09-28)
 
 This release makes it easier to restart and update Glide without losing your

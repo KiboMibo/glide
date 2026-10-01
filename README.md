@@ -30,6 +30,12 @@ glide launch
 
 _Note:_ If you don't have Homebrew, see the "manual installation" section below.
 
+> [!NOTE]
+> This is the KiboMibo fork of Glide. To install the fork, with its scratchpad
+> windows, trackpad scrolling and desktop assignment, use its tap instead:
+> `brew install --cask KiboMibo/tap/glide-kibo`. Fork builds are signed ad hoc
+> and update with `brew upgrade --cask glide-kibo`.
+
 The first time you do this, you will have to follow instructions to enable
 Accessibility permissions.
 

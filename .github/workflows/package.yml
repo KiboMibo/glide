@@ -16,6 +16,8 @@ env:
 
 jobs:
   package:
+    # Signing needs the upstream secrets; fork releases come from build.yml.
+    if: github.repository == 'glide-wm/glide'
     environment: packaging
     runs-on: macos-15
     permissions:

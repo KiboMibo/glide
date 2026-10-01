@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "glide-wm"
-version = "0.2.15-kibo.2"
+version = "0.2.16-kibo.1"
 dependencies = [
  "accessibility",
  "accessibility-sys",
