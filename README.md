@@ -128,6 +128,34 @@ Some limitations:
 
 See `scratchpad` and `toggle_scratchpad` in [glide.default.toml] for details.
 
+### Assigning apps to desktops
+
+To open an app's windows on a particular desktop, add a window rule with
+`space`, the number of the desktop in Mission Control counting from 1:
+
+```toml
+[[window_rules]]
+if.app_id = "ru.keepcoder.Telegram"
+space = 3
+
+[[window_rules]]
+if.app_name = "Slack"
+space = 2
+float = true  # optional; `float` and `space` combine
+```
+
+When a matching window opens, Glide moves it to that desktop; it shows up in
+the layout there the next time you switch to it. Some details:
+
+- Desktops are numbered across all displays in Mission Control order, and
+  fullscreen apps are not counted.
+- Only windows that open while Glide is running are moved. Windows that are
+  already open when Glide starts stay where they are.
+- Only standard windows are moved, so dialogs and panels stay with the window
+  that opened them.
+- Moving windows between desktops requires macOS 26 or later. If the desktop
+  does not exist or the move fails, the window stays on the current desktop.
+
 ## Manual installation
 
 [Download the latest release][latest] from the releases page.

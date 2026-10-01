@@ -326,6 +326,16 @@ fn scratchpad_rule<'a>(
     ))
 }
 
+/// The desktop number of the first rule matching the window, if that rule has
+/// a `space`. Only standard windows Glide tracks are moved, so dialogs and
+/// panels stay with the window that opened them.
+fn space_rule(rules: &[WindowRule], info: &LayoutWindowInfo) -> Option<u32> {
+    if !info.is_standard || classify_window(rules, info) == WindowClass::Untracked {
+        return None;
+    }
+    rules.iter().find(|rule| window_rule_matches(&rule.conditions, info))?.space
+}
+
 fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass {
     use LayoutWindowInfo as Info;
 
@@ -364,12 +374,13 @@ fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass
     }
 
     // The first matching user rule overrides the built-in heuristics below.
+    // A rule with only `space` keeps the built-in heuristics.
     if let Some(rule) = rules.iter().find(|rule| window_rule_matches(&rule.conditions, info)) {
-        return if rule.scratchpad.is_some() || rule.float == Some(true) {
-            WindowClass::FloatByDefault
-        } else {
-            WindowClass::Regular
-        };
+        match (&rule.scratchpad, rule.float) {
+            (Some(_), _) | (_, Some(true)) => return WindowClass::FloatByDefault,
+            (None, Some(false)) => return WindowClass::Regular,
+            (None, None) => {}
+        }
     }
 
     match info {
@@ -1217,6 +1228,17 @@ impl LayoutManager {
         self.scratchpads.cancel_pending_shows_for_app(bundle_id);
     }
 
+    /// The desktop number a newly opened window should be moved to, from the
+    /// `space` of the first window rule it matches.
+    pub fn rule_space(&self, info: &LayoutWindowInfo) -> Option<u32> {
+        space_rule(&self.window_rules, info)
+    }
+
+    /// Whether the window is in the layout of any space, tiled or floating.
+    pub fn has_window(&self, wid: WindowId) -> bool {
+        self.tree.has_window(wid) || self.floating_windows.contains(&wid)
+    }
+
     pub fn scratchpad_window(&self, name: &str) -> Option<WindowId> {
         self.scratchpads.window(name).map(|(wid, _)| wid)
     }
@@ -1968,8 +1990,36 @@ mod tests {
     }
 
     #[test]
+    fn space_only_rule_keeps_heuristics_and_moves_standard_windows() {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: None,
+            scratchpad: None,
+            frame: None,
+            space: Some(2),
+        }];
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+        assert_eq!(space_rule(&rules, &info), Some(2));
+
+        info.bundle_id = Some("com.example.Y".into());
+        assert_eq!(space_rule(&rules, &info), None);
+
+        // Dialogs stay with the window that opened them, and still float.
+        info.bundle_id = Some("com.example.X".into());
+        info.is_standard = false;
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+        assert_eq!(space_rule(&rules, &info), None);
+    }
+
+    #[test]
     fn app_id_rule_floats_matching_window_only() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
@@ -1991,6 +2041,7 @@ mod tests {
     fn earlier_rule_wins() {
         let rules = [
             WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     title_regex: Some("Dialog".parse().unwrap()),
@@ -2001,6 +2052,7 @@ mod tests {
                 frame: None,
             },
             WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
@@ -2023,6 +2075,7 @@ mod tests {
     #[test]
     fn rule_conditions_combine_with_and() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_name: Some("Code".into()),
                 title_substring: Some("Settings".into()),
@@ -2050,6 +2103,7 @@ mod tests {
     #[test]
     fn rule_conditions_match_case_insensitively() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("COM.EXAMPLE.x".into()),
                 app_name: Some("code".into()),
@@ -2077,6 +2131,7 @@ mod tests {
         // A rule that requires an attribute must not match a window that lacks
         // it; the condition should fail rather than be skipped.
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
@@ -2094,6 +2149,7 @@ mod tests {
     fn rule_overrides_builtin_float_heuristics() {
         // System Preferences floats by default; a rule can force it to tile.
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.apple.systempreferences".into()),
                 ..Default::default()
@@ -2108,6 +2164,7 @@ mod tests {
 
         // A non-resizable window floats by default; a rule can force it to tile.
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
@@ -2125,6 +2182,7 @@ mod tests {
     #[test]
     fn scratchpad_rule_floats_window() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
@@ -2143,6 +2201,7 @@ mod tests {
 
     fn app_rule(app_id: &str, float: Option<bool>, scratchpad: Option<&str>) -> WindowRule {
         WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some(app_id.into()),
                 ..Default::default()
@@ -2186,6 +2245,7 @@ mod tests {
     #[test]
     fn scratchpad_rule_cannot_track_phantom_windows() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions::default(),
             float: None,
             scratchpad: Some("x".into()),
@@ -2199,6 +2259,7 @@ mod tests {
     #[test]
     fn rules_cannot_override_untracked_phantom_windows() {
         let rules = [WindowRule {
+            space: None,
             conditions: WindowRuleConditions::default(),
             float: Some(true),
             scratchpad: None,
@@ -2212,6 +2273,7 @@ mod tests {
     fn scratchpad_manager(frame: Option<FractionalRect>) -> (LayoutManager, SpaceId) {
         let mut config = Config::default();
         config.window_rules = vec![WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.pad".into()),
                 ..Default::default()
@@ -2371,6 +2433,7 @@ mod tests {
         let mut config = Config::default();
         config.window_rules = name
             .map(|name| WindowRule {
+                space: None,
                 conditions: WindowRuleConditions {
                     app_id: Some("com.example.pad".into()),
                     ..Default::default()
@@ -2439,6 +2502,7 @@ mod tests {
     fn scratchpads_registered_by_one_event_are_all_shown() {
         use LayoutEvent::*;
         let rule = |subrole: &str, name: &str| WindowRule {
+            space: None,
             conditions: WindowRuleConditions {
                 app_id: Some("com.example.pad".into()),
                 ax_subrole: Some(subrole.into()),

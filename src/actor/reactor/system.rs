@@ -51,6 +51,18 @@ pub trait SystemActions {
         space: SpaceId,
         id: SpaceMoveId,
     ) -> Result<(), SpaceMoveError>;
+
+    /// Starts moving a window to the desktop with the given number, counting
+    /// from 1 in Mission Control order, like
+    /// [`move_window_to_space`](Self::move_window_to_space). Fails with
+    /// [`SpaceMoveError::AlreadyOnSpace`] when the window is on it already.
+    fn move_window_to_desktop(
+        &mut self,
+        wid: WindowId,
+        wsid: WindowServerId,
+        desktop: u32,
+        id: SpaceMoveId,
+    ) -> Result<(), SpaceMoveError>;
 }
 
 /// Performs no actions. Checks the bundle id like [`LiveSystem`].
@@ -78,6 +90,17 @@ impl SystemActions for NoSystem {
         info!(?wid, ?space, "Not moving window without a live system");
         Ok(())
     }
+
+    fn move_window_to_desktop(
+        &mut self,
+        wid: WindowId,
+        _wsid: WindowServerId,
+        desktop: u32,
+        _id: SpaceMoveId,
+    ) -> Result<(), SpaceMoveError> {
+        info!(?wid, desktop, "Not moving window without a live system");
+        Ok(())
+    }
 }
 
 /// Starts `open` for a bundle id and calls back with whether it succeeded.
@@ -88,6 +111,12 @@ type MoveFn = fn(WindowServerId, SpaceId) -> Result<(), SpaceMoveError>;
 /// The pid that owns a window, according to the window server.
 type OwnerFn = fn(WindowServerId) -> Option<pid_t>;
 
+/// The desktops in Mission Control order.
+type DesktopsFn = fn() -> Vec<SpaceId>;
+
+/// The spaces a window is on.
+type WindowSpacesFn = fn(WindowServerId) -> Vec<SpaceId>;
+
 pub struct LiveSystem {
     reactor_tx: Sender,
     ws_tx: window_server::Sender,
@@ -95,6 +124,8 @@ pub struct LiveSystem {
     launch: LaunchFn,
     move_window: MoveFn,
     window_owner: OwnerFn,
+    desktops: DesktopsFn,
+    window_spaces: WindowSpacesFn,
 }
 
 impl LiveSystem {
@@ -110,6 +141,8 @@ impl LiveSystem {
             launch: |bundle_id, on_exit| app::launch_app_then(bundle_id, on_exit),
             move_window: space_move::move_window_to_space,
             window_owner: |wsid| crate::sys::window_server::get_window(wsid).map(|info| info.pid),
+            desktops: crate::sys::screen::desktop_spaces,
+            window_spaces: space_move::spaces_for_window,
         }
     }
 }
@@ -158,6 +191,23 @@ impl SystemActions for LiveSystem {
             event: Event::ScratchpadMoveEnded(id),
         });
         Ok(())
+    }
+
+    fn move_window_to_desktop(
+        &mut self,
+        wid: WindowId,
+        wsid: WindowServerId,
+        desktop: u32,
+        id: SpaceMoveId,
+    ) -> Result<(), SpaceMoveError> {
+        let space = desktop
+            .checked_sub(1)
+            .and_then(|idx| (self.desktops)().get(idx as usize).copied())
+            .ok_or(SpaceMoveError::NoSuchDesktop(desktop))?;
+        if (self.window_spaces)(wsid).contains(&space) {
+            return Err(SpaceMoveError::AlreadyOnSpace);
+        }
+        self.move_window_to_space(wid, wsid, space, id)
     }
 }
 
@@ -396,6 +446,8 @@ mod tests {
         system.launch = hanging_launch;
         system.move_window = |_, _| panic!("tests must not move windows");
         system.window_owner = |_| panic!("tests must not query the window server");
+        system.desktops = || panic!("tests must not query the desktops");
+        system.window_spaces = |_| panic!("tests must not query the window server");
         (system, reactor_rx, delayed_rx)
     }
 
@@ -461,6 +513,48 @@ mod tests {
         }
         assert!(ws_rx.try_recv().is_err());
         assert!(delayed_rx.try_recv().is_err());
+    }
+
+    fn desktop_system() -> (LiveSystem, actor::Receiver<window_server::Event>) {
+        let (reactor_tx, _reactor_rx) = reactor::channel();
+        let (ws_tx, ws_rx) = actor::channel();
+        let (delayed_tx, _delayed_rx) = actor::channel();
+        let mut system = LiveSystem::new(reactor_tx, ws_tx, delayed_tx);
+        system.desktops = || vec![SpaceId::new(1), SpaceId::new(5), SpaceId::new(8)];
+        system.window_spaces = |_| vec![SpaceId::new(1)];
+        system.window_owner = |_| Some(3);
+        (system, ws_rx)
+    }
+
+    #[test]
+    fn move_to_desktop_moves_to_the_numbered_space() {
+        let (mut system, mut ws_rx) = desktop_system();
+        system.move_window = |wsid, space| {
+            assert_eq!((wsid, space), (WindowServerId::new(9), SpaceId::new(5)));
+            Ok(())
+        };
+        system
+            .move_window_to_desktop(WindowId::new(3, 1), WindowServerId::new(9), 2, SpaceMoveId(0))
+            .unwrap();
+        assert!(ws_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn move_to_missing_or_current_desktop_does_nothing() {
+        let (mut system, mut ws_rx) = desktop_system();
+        system.move_window = |_, _| panic!("the window must not be moved");
+        let mut move_to = |desktop| {
+            system.move_window_to_desktop(
+                WindowId::new(3, 1),
+                WindowServerId::new(9),
+                desktop,
+                SpaceMoveId(0),
+            )
+        };
+        assert!(matches!(move_to(0), Err(SpaceMoveError::NoSuchDesktop(0))));
+        assert!(matches!(move_to(4), Err(SpaceMoveError::NoSuchDesktop(4))));
+        assert!(matches!(move_to(1), Err(SpaceMoveError::AlreadyOnSpace)));
+        assert!(ws_rx.try_recv().is_err());
     }
 
     #[test]
